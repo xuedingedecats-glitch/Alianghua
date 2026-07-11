@@ -1,0 +1,14 @@
+{
+  "updated_at": "",
+  "manual_codes": [],
+  "auto_codes": [],
+  "excluded_auto_codes": [],
+  "auto_sync": {
+    "enabled": false,
+    "top_n": 12,
+    "min_score": 72.0,
+    "last_synced_at": "",
+    "last_signal_file": ""
+  },
+  "codes": []
+}

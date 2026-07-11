@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and local environment
+.env
+.env.*
+!quant-web.env.example
+.quant_web_token
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime data (must never enter source control)
+.a_share_cache/
+logs/
+a_share_daily_reports/
+opening_watchlist.json
+*.log
+*.pid
+
+# Local databases / exports
+*.db
+*.sqlite
+*.sqlite3
+
+# Backups and temporary files
+*.backup*
+*.bak*
+*.before_*
+app.py.bak_*
+app.py.before_*
+a_share_daily.py.before_*
+*.tmp
+*.temp
+~$*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

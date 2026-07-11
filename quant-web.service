@@ -1,0 +1,40 @@
+[Unit]
+Description=A-share Quant Recommendation Web
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quantweb
+Group=quantweb
+WorkingDirectory=/opt/a_share_quant_web
+EnvironmentFile=/etc/quant-web.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/a_share_quant_web/.venv/bin/python /opt/a_share_quant_web/app.py --host 0.0.0.0 --port 8766
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+
+# systemd sandbox hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quant-web
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

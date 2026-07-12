@@ -435,6 +435,12 @@ def strategy_group_name(strategy: str) -> str:
         return "超跌反转类"
     return "综合类"
 
+def strategy_consensus_bonus(groups: List[str]) -> float:
+    """Only reward independent strategy categories; correlated tactics in one category add no score."""
+    distinct = {str(x).strip() for x in groups if str(x).strip()}
+    return float(min(6, 2 * max(0, len(distinct) - 1)))
+
+
 def fmt_money(x: float) -> str:
     if pd.isna(x):
         return "-"
@@ -1349,7 +1355,9 @@ def scan(args: argparse.Namespace) -> Tuple[pd.DataFrame, Dict[str, Any]]:
                 if "strategy_group" in g.columns:
                     top["strategy_group"] = "+".join(sorted(set(g["strategy_group"].dropna().astype(str).tolist())))
                 top["reason"] += "；兼具信号: " + ", ".join(g["strategy"].tolist()[1:])
-                top["score"] = min(99, round(float(top["score"]) + min(6, 2 * (len(g) - 1)), 1))
+                # 相关性很高的同类战法不重复奖励；只有跨战法大类的共振才加排序分。
+                groups = g["strategy_group"].dropna().astype(str).tolist() if "strategy_group" in g.columns else []
+                top["score"] = min(99, round(float(top["score"]) + strategy_consensus_bonus(groups), 1))
             merged.append(top)
         df = pd.DataFrame(merged).sort_values(["score", "amount"], ascending=False).head(args.top).reset_index(drop=True)
     return df, meta
@@ -1524,9 +1532,9 @@ def write_outputs(signals: pd.DataFrame, meta: Dict[str, Any], review: pd.DataFr
         lines.append("说明：以下为以**信号日收盘**为基准的日线观察，并非真实成交收益；目标价与止损价若同日均触及，日线无法判断先后。")
         lines.append(df_to_markdown(review, ["code", "name", "strategy", "signal_date", "latest_date", "ret_latest_pct", "max_high_pct", "max_drawdown_pct", "target_hit", "stop_hit", "status"]))
         sm = review_summary(review)
-        lines.append(f"样本 {sm['sample_count']} 只；有可观察收盘数据 {sm['observed_count']} 只；正收益占比 {sm['positive_rate_pct'] if sm['positive_rate_pct'] is not None else '-'}%；平均观察收益 {sm['avg_observation_return_pct'] if sm['avg_observation_return_pct'] is not None else '-'}%；曾达目标 {sm['target_hit_count']} 只；曾触止损 {sm['stop_hit_count']} 只。")
+        lines.append(f"样本 {sm['sample_count']} 只；有可观察收盘数据 {sm['observed_count']} 只；观察期正收益比例 {sm['positive_rate_pct'] if sm['positive_rate_pct'] is not None else '-'}%；平均观察收益 {sm['avg_observation_return_pct'] if sm['avg_observation_return_pct'] is not None else '-'}%；曾达目标 {sm['target_hit_count']} 只；曾触止损 {sm['stop_hit_count']} 只。")
         lines.append("")
-    lines.append("## 今日候选（按综合评分排序）")
+    lines.append("## 今日候选（按规则评分排序）")
     if signals.empty:
         lines.append("今天没有通过过滤条件的强信号。弱市或无信号时，建议空仓/轻仓等待，而不是降低标准。")
     else:
@@ -1538,7 +1546,7 @@ def write_outputs(signals: pd.DataFrame, meta: Dict[str, Any], review: pd.DataFr
         lines.append("")
         lines.append("## 入选理由")
         for _, r in signals.iterrows():
-            lines.append(f"- **{r['code']} {r['name']}**（{r['strategy']}，评分 {r['score']}）：{r['reason']}。")
+            lines.append(f"- **{r['code']} {r['name']}**（{r['strategy']}，规则评分 {r['score']}）：{r['reason']}。")
     lines.append("")
     lines.append("## 执行纪律")
     lines.append("1. 脚本只做技术面候选筛选，不保证胜率，不构成投资建议。")

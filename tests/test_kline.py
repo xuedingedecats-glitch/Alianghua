@@ -90,19 +90,64 @@ class KlineTests(unittest.TestCase):
 
     def test_payload_cache_avoids_duplicate_source_request(self):
         source = self.bars(140)
-        with mock.patch.object(app, "_chart_daily_bars", return_value=(source, "平安银行", "测试源")) as fetch:
+        current = app.dt.datetime(2026, 7, 12, 12, 30, 0)
+        with mock.patch.object(app, "now_cn", return_value=current), \
+             mock.patch.object(app, "_chart_daily_bars", return_value=(source, "平安银行", "测试源")) as fetch:
             first = app.kline_payload("000001", "day", 120)
             second = app.kline_payload("000001", "day", 120)
         self.assertEqual(fetch.call_count, 1)
-        self.assertEqual(first, second)
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(second["cache_age_seconds"], 0)
+        self.assertEqual(second["served_at"], "2026-07-12 12:30:00")
+        self.assertEqual(second["latest_bar_date"], first["latest_bar_date"])
+
+    def test_force_refresh_bypasses_server_cache(self):
+        source = self.bars(140)
+        with mock.patch.object(app, "_chart_daily_bars", return_value=(source, "平安银行", "测试源")) as fetch:
+            app.kline_payload("000001", "day", 120)
+            refreshed = app.kline_payload("000001", "day", 120, force_refresh=True)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertFalse(refreshed["cached"])
+
+    def test_refresh_policy_on_weekend(self):
+        policy = app.kline_refresh_policy(app.dt.datetime(2026, 7, 12, 10, 0, 0))
+        self.assertFalse(policy["market_active"])
+        self.assertEqual(policy["cache_ttl_seconds"], app.KLINE_CACHE_TTL)
+        self.assertEqual(policy["auto_refresh_seconds"], 300)
+        self.assertEqual(policy["market_state"], "非交易时段")
+
+    def test_refresh_policy_during_weekday_session(self):
+        policy = app.kline_refresh_policy(app.dt.datetime(2026, 7, 13, 10, 0, 0))
+        self.assertTrue(policy["market_active"])
+        self.assertEqual(policy["cache_ttl_seconds"], app.KLINE_ACTIVE_CACHE_TTL)
+        self.assertEqual(policy["auto_refresh_seconds"], 30)
+        self.assertEqual(policy["market_state"], "交易时段")
+
+    def test_new_payload_explains_market_cutoff_and_query_time(self):
+        rows = [{"date": "2026-07-10", "open": 10.0, "close": 10.2, "high": 10.5, "low": 9.8, "volume": 1000.0}] * 80
+        current = app.dt.datetime(2026, 7, 12, 12, 30, 0)
+        with mock.patch.object(app, "now_cn", return_value=current), \
+             mock.patch.object(app, "_chart_daily_bars", return_value=(rows, "平安银行", "测试源")):
+            result = app.kline_payload("000001", "day", 40)
+        self.assertFalse(result["cached"])
+        self.assertEqual(result["latest_bar_date"], "2026-07-10")
+        self.assertEqual(result["fetched_at"], "2026-07-12 12:30:00")
+        self.assertEqual(result["served_at"], "2026-07-12 12:30:00")
+        self.assertEqual(result["market_state"], "非交易时段")
+        self.assertIn("不是自然日 2026-07-12 的行情", result["note"])
 
     def test_page_contains_periods_mas_and_kline_click(self):
         data = {"has_data": True, "rows": [{"code": "000001", "name": "平安银行"}], "watchlist": {}, "group_order": ["全部"], "strategy_book": []}
         html = app.page_html(data)
-        for text in ('id="klineModal"', "日线", "周线", "月线", "全屏", "120根", "240根", "480根", "＋ 放大", "－ 缩小", "较早", "较新", "function openKline", "[5,10,20,60]", "MA${n}"):
+        for text in ('id="klineModal"', "日线", "周线", "月线", "全屏", "刷新行情", "自动刷新", "120根", "240根", "480根", "＋ 放大", "－ 缩小", "较早", "较新", "function openKline", "[5,10,20,60]", "MA${n}"):
             self.assertIn(text, html)
         self.assertIn("onclick=\"openKline('${esc(r.code)}')\"", app.SCRIPT)
         self.assertNotIn("openKline('${esc(r.code)}','${esc(r.name)}')", app.SCRIPT)
+
+    def test_page_contains_refresh_semantics_and_state_preservation(self):
+        for text in ("function scheduleKlineRefresh", "function setKlineAutoRefresh", "行情截止", "非交易时段约5分钟", "oldVisible", "oldOffset", "cache:'no-store'", "refresh=1", "刷新中…"):
+            self.assertIn(text, app.SCRIPT)
 
     def test_kline_modal_stays_above_sticky_navigation(self):
         self.assertIn("z-index:1000", app.STYLE)

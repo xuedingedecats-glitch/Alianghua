@@ -140,14 +140,18 @@ class KlineTests(unittest.TestCase):
     def test_page_contains_periods_mas_and_kline_click(self):
         data = {"has_data": True, "rows": [{"code": "000001", "name": "平安银行"}], "watchlist": {}, "group_order": ["全部"], "strategy_book": []}
         html = app.page_html(data)
-        for text in ('id="klineModal"', "日线", "周线", "月线", "全屏", "刷新行情", "自动刷新", "120根", "240根", "480根", "＋ 放大", "－ 缩小", "较早", "较新", "function openKline", "[5,10,20,60]", "MA${n}"):
+        for text in ('id="klineModal"', "日线", "周线", "月线", "全屏", "刷新行情", "自动刷新", "120根", "240根", "480根", "640根", "＋ 放大", "－ 缩小", "较早", "较新", "function openKline", "[5,10,20,60]", "MA${n}"):
             self.assertIn(text, html)
         self.assertIn("onclick=\"openKline('${esc(r.code)}')\"", app.SCRIPT)
         self.assertNotIn("openKline('${esc(r.code)}','${esc(r.name)}')", app.SCRIPT)
 
     def test_page_contains_refresh_semantics_and_state_preservation(self):
-        for text in ("function scheduleKlineRefresh", "function setKlineAutoRefresh", "行情截止", "非交易时段约5分钟", "oldVisible", "oldOffset", "cache:'no-store'", "refresh=1", "刷新中…"):
+        for text in ("function scheduleKlineRefresh", "function setKlineAutoRefresh", "行情截止", "非交易时段约5分钟", "oldVisible", "oldOffset", "cache:'no-store'", "refresh=1", "刷新中…", "klineRefreshStatus", "下次自动刷新", "clearKlineRefreshTimers", "onpointerdown", "visibilitychange", "refreshBtn.disabled=false", "scheduleKlineRefresh(60)"):
             self.assertIn(text, app.SCRIPT)
+
+    def test_kline_supports_countdown_drag_and_keyboard_navigation(self):
+        for text in ("nextRefreshAt", "setInterval(updateKlineRefreshStatus,1000)", "panKline(dx>0?-1:1)", "ArrowLeft", "ArrowRight", "touch-action:none"):
+            self.assertIn(text, app.SCRIPT + app.STYLE)
 
     def test_kline_modal_stays_above_sticky_navigation(self):
         self.assertIn("z-index:1000", app.STYLE)

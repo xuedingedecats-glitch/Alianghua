@@ -26,6 +26,7 @@ env/
 logs/
 a_share_daily_reports/
 opening_watchlist.json
+trade_journal.json
 *.log
 *.pid
 

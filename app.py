@@ -31,6 +31,9 @@ WEB_TOKEN = os.environ.get("QUANT_WEB_TOKEN", "").strip()
 FUNDAMENTAL_CACHE_TTL = int(os.environ.get("QUANT_WEB_FUNDAMENTAL_CACHE_TTL", "900"))
 FUNDAMENTAL_LOCK = threading.Lock()
 FUNDAMENTAL_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+KLINE_CACHE_TTL = int(os.environ.get("QUANT_WEB_KLINE_CACHE_TTL", "300"))
+KLINE_CACHE_LOCK = threading.Lock()
+KLINE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 OPENING_LOCK = threading.Lock()
 OPENING_REFRESH_LOCK = threading.Lock()
 OPENING_CACHE: Dict[str, Any] = {"at": 0.0, "source": "", "payload": {}}
@@ -670,6 +673,117 @@ def fetch_daily_kline(code: str, days: int = 100) -> List[Dict[str, Any]]:
     return [row for row in out if row["date"] < today][-days:]
 
 
+
+def _chart_daily_bars(code: str, limit: int = 4200) -> Tuple[List[Dict[str, Any]], str, str]:
+    """获取含当日动态日K的前复权数据；东方财富主源，腾讯备用。"""
+    _, secid, _ = code_market(code); errors: List[str] = []
+    try:
+        params = {"secid": secid, "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                  "klt": 101, "fqt": 1, "beg": "19900101", "end": "20500101", "lmt": limit}
+        r = requests.get("https://push2his.eastmoney.com/api/qt/stock/kline/get", params=params,
+                         headers={"User-Agent":"Mozilla/5.0", "Referer":"https://quote.eastmoney.com/"}, timeout=10); r.raise_for_status()
+        data = r.json().get("data") or {}; out = []
+        for raw in data.get("klines") or []:
+            f = str(raw).split(",")
+            try: out.append({"date":f[0], "open":float(f[1]), "close":float(f[2]), "high":float(f[3]), "low":float(f[4]), "volume":float(f[5])})
+            except (ValueError, IndexError): pass
+        if out: return out[-limit:], str(data.get("name") or code), "东方财富"
+    except Exception as exc: errors.append(f"eastmoney:{type(exc).__name__}")
+    try:
+        market, _, _ = code_market(code); symbol = market.lower() + code
+        r = requests.get("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get", params={"param":f"{symbol},day,,,{min(limit, 1300)},qfq"},
+                         headers={"User-Agent":"Mozilla/5.0", "Referer":"https://gu.qq.com/"}, timeout=10); r.raise_for_status()
+        node = ((r.json().get("data") or {}).get(symbol) or {}); rows = node.get("qfqday") or node.get("day") or []; out=[]
+        for f in rows:
+            try: out.append({"date":str(f[0]), "open":float(f[1]), "close":float(f[2]), "high":float(f[3]), "low":float(f[4]), "volume":float(f[5])})
+            except (ValueError, TypeError, IndexError): pass
+        quote = ((node.get("qt") or {}).get(symbol) or [])
+        if out: return out[-limit:], str(quote[1] if len(quote) > 1 else code), "腾讯行情"
+    except Exception as exc: errors.append(f"tencent:{type(exc).__name__}")
+    raise RuntimeError("K线双数据源均不可用：" + ", ".join(errors))
+
+
+def _tencent_period_bars(code: str, period: str, limit: int) -> Tuple[List[Dict[str, Any]], str, str]:
+    """腾讯周/月前复权K线，用于东方财富不可用时补足长周期均线。"""
+    if period not in {"week", "month"}:
+        raise ValueError("腾讯长周期只支持 week、month")
+    market, _, _ = code_market(code); symbol = market.lower() + code
+    request_limit = min(max(int(limit), 120), 640)
+    r = requests.get(
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        params={"param": f"{symbol},{period},,,{request_limit},qfq"},
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
+        timeout=10,
+    )
+    r.raise_for_status(); node = ((r.json().get("data") or {}).get(symbol) or {})
+    raw_rows = node.get("qfq" + period) or node.get(period) or []; out=[]
+    for f in raw_rows:
+        try: out.append({"date":str(f[0]), "open":float(f[1]), "close":float(f[2]), "high":float(f[3]), "low":float(f[4]), "volume":float(f[5])})
+        except (ValueError, TypeError, IndexError): pass
+    if not out: raise RuntimeError("腾讯长周期K线暂不可用")
+    quote = ((node.get("qt") or {}).get(symbol) or [])
+    return out[-request_limit:], str(quote[1] if len(quote) > 1 else code), "腾讯行情"
+
+
+def _aggregate_kline(rows: List[Dict[str, Any]], period: str) -> List[Dict[str, Any]]:
+    if period == "day": return [dict(x) for x in rows]
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        try: date = dt.date.fromisoformat(str(row.get("date")))
+        except ValueError: continue
+        key = f"{date.isocalendar().year}-W{date.isocalendar().week:02d}" if period == "week" else f"{date.year}-{date.month:02d}"
+        grouped.setdefault(key, []).append(row)
+    out=[]
+    for items in grouped.values():
+        out.append({"date":items[-1]["date"], "open":items[0]["open"], "close":items[-1]["close"],
+                    "high":max(x["high"] for x in items), "low":min(x["low"] for x in items), "volume":sum(x["volume"] for x in items)})
+    return out
+
+
+def _with_moving_averages(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    closes = [safe_float(x.get("close")) for x in rows]; out=[]
+    for i, raw in enumerate(rows):
+        row = dict(raw)
+        for n in (5, 10, 20, 60):
+            row[f"ma{n}"] = round(sum(closes[i-n+1:i+1]) / n, 3) if i + 1 >= n else None
+        for field in ("open", "close", "high", "low", "volume"):
+            row[field] = round(safe_float(row.get(field)), 3 if field != "volume" else 0)
+        out.append(row)
+    return out
+
+
+def kline_payload(raw_code: Any, raw_period: Any = "day", raw_limit: Any = 120) -> Dict[str, Any]:
+    code = clean_stock_code(raw_code); period = str(raw_period or "day").lower()
+    aliases = {"d":"day", "daily":"day", "w":"week", "weekly":"week", "m":"month", "monthly":"month"}; period = aliases.get(period, period)
+    if period not in {"day", "week", "month"}: raise ValueError("K线周期只支持 day、week、month")
+    try: limit = int(raw_limit)
+    except (TypeError, ValueError): raise ValueError("K线数量参数无效")
+    limit = max(40, min(limit, 240)); key=f"{code}:{period}:{limit}"; now=time.time()
+    with KLINE_CACHE_LOCK:
+        cached=KLINE_CACHE.get(key)
+        if cached and now-cached[0] < KLINE_CACHE_TTL: return dict(cached[1])
+    source_limits = {"day": limit + 60, "week": (limit + 60) * 6, "month": (limit + 60) * 24}
+    daily, name, source = _chart_daily_bars(code, source_limits[period])
+    if source == "腾讯行情" and period in {"week", "month"}:
+        period_rows, name, source = _tencent_period_bars(code, period, limit + 60)
+        aggregation_note = "周线和月线使用数据源提供的前复权长周期K线。"
+    else:
+        period_rows = _aggregate_kline(daily, period)
+        aggregation_note = "周线和月线由前复权日线聚合。"
+    # 多取60根用于均线预热，最终只返回页面需要的数量。
+    calculated = _with_moving_averages(period_rows)
+    rows = calculated[-limit:]
+    if not rows: raise RuntimeError("未获得可展示的K线数据")
+    payload={"ok":True,"code":code,"name":name,"period":period,"source":source,"adjust":"前复权","updated_at":now_cn().strftime("%Y-%m-%d %H:%M:%S"),"rows":rows,
+             "ma_periods":[5,10,20,60],"note":"日线盘中最后一根可能随当日行情变化；" + aggregation_note}
+    with KLINE_CACHE_LOCK:
+        KLINE_CACHE[key]=(now,dict(payload))
+        if len(KLINE_CACHE)>200:
+            oldest=sorted(KLINE_CACHE.items(),key=lambda x:x[1][0])[:50]
+            for old_key,_ in oldest: KLINE_CACHE.pop(old_key,None)
+    return payload
+
+
 def custom_watch_plan(code: str) -> Dict[str, Any]:
     code=clean_stock_code(code)
     base={"code":code,"name":code,"strategy_group":"自定义保守趋势确认","strategy":"MA20/MA60趋势 + 开盘承接","is_custom":True}
@@ -1130,7 +1244,7 @@ async function mutate(body){try{journal=await api('POST',body);renderJournal()}c
 
 def page_html(payload: Dict[str,Any]) -> str:
     data=script_json(payload)
-    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>A股量化推荐驾驶舱</title><style>{STYLE}</style></head><body><div class="bg-orb one"></div><div class="bg-orb two"></div><main class="wrap" id="app"></main><div class="modal" id="modal"><div class="modal-card"><button class="x" onclick="hideReport()">×</button><h2>Markdown报告</h2><pre id="reportText"></pre></div></div><script>window.__DATA__={data};{SCRIPT}</script></body></html>'''
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>A股量化推荐驾驶舱</title><style>{STYLE}</style></head><body><div class="bg-orb one"></div><div class="bg-orb two"></div><main class="wrap" id="app"></main><div class="modal" id="modal"><div class="modal-card"><button class="x" onclick="hideReport()">×</button><h2>Markdown报告</h2><pre id="reportText"></pre></div></div><div class="modal" id="klineModal"><div class="modal-card kline-card"><button class="x" onclick="closeKline()">×</button><div class="kline-head"><div><span class="eyebrow">前复权行情 · 仅供技术复盘</span><h2 id="klineTitle">K线图</h2><div id="klineMeta" class="small muted"></div></div><div class="kline-actions"><button class="filter-btn active" data-period="day" onclick="setKlinePeriod('day')">日线</button><button class="filter-btn" data-period="week" onclick="setKlinePeriod('week')">周线</button><button class="filter-btn" data-period="month" onclick="setKlinePeriod('month')">月线</button><button class="filter-btn" onclick="klineToFundamental()">查看基本面</button></div></div><div id="klineMa" class="kline-ma"></div><div id="klineInfo" class="kline-info">点击代码后加载K线数据</div><div class="kline-canvas-wrap"><canvas id="klineCanvas" aria-label="股票K线图"></canvas><div id="klineLoading" class="kline-loading">正在加载K线…</div></div><div class="small muted kline-note" id="klineNote">红色为上涨，绿色为下跌；均线随所选日/周/月周期计算。</div></div></div><script>window.__DATA__={data};{SCRIPT}</script></body></html>'''
 
 
 def opening_page_html(payload: Dict[str, Any]) -> str:
@@ -1225,6 +1339,10 @@ STYLE += r'''
 .monitor-toolbar{margin:11px 0 0;padding:10px 12px;border:1px solid #315b79;border-radius:13px;background:#0a1d31;display:flex;align-items:center;gap:9px;flex-wrap:wrap}.monitor-toolbar b{color:#8fe6ff}.monitor-toolbar .small{margin-right:auto}.monitor-auto{display:flex;gap:6px;align-items:center;padding:5px 8px;border:1px solid #39718b;border-radius:999px;color:#cfeafa;font-size:12px;cursor:pointer;background:#0b3851}.monitor-auto input{accent-color:#45c58a}.watch-check{accent-color:#31c3ff;width:16px;height:16px;cursor:pointer}.monitor-save-state{font-size:12px;color:#7ee7b6}.monitor-save-state[data-kind="saving"]{color:#ffe28b}.monitor-save-state[data-kind="error"]{color:#ff9baa}.monitor-add{background:#126b50!important;border-color:#55dda9!important;color:#dffff2!important}.monitor-choice{display:flex;align-items:center;gap:5px;white-space:nowrap;font-size:11px;color:#8fb3d3;cursor:pointer}.monitor-choice:has(input:checked){color:#8ff0c4;font-weight:900}.watch-chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.watch-chip{display:inline-flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid #355b7a;background:#0a1d31;border-radius:999px;color:#d9edff;font-size:12px}.watch-chip small{color:#7fb2d8}.watch-chip button{border:0;background:transparent;color:#ff9baa;font-size:17px;line-height:1;cursor:pointer}.watch-add{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.watch-add .fundamental-input{max-width:460px}@media(max-width:650px){.watch-add .fundamental-input{min-width:100%;max-width:none}.monitor-toolbar .small{width:100%;margin-right:0}}
 '''
 
+STYLE += r'''
+.kline-card{width:min(1180px,94vw);max-width:none;max-height:94vh;padding:20px}.kline-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding-right:34px}.kline-head h2{margin:7px 0 5px}.kline-actions,.kline-ma{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.kline-ma{margin:14px 0 8px}.ma-toggle{display:flex;gap:6px;align-items:center;border:1px solid #33536f;background:#0a1b2e;border-radius:999px;padding:6px 9px;font-size:12px;cursor:pointer}.ma-toggle input{accent-color:var(--ma-color)}.kline-info{min-height:24px;color:#cfe8ff;font-size:13px;margin:6px 0}.kline-canvas-wrap{position:relative;border:1px solid #284967;border-radius:14px;background:#071321;overflow:hidden}.kline-canvas-wrap canvas{display:block;width:100%;height:560px;cursor:crosshair}.kline-loading{position:absolute;inset:0;display:grid;place-items:center;background:rgba(5,13,24,.82);color:#9edfff;font-weight:850}.kline-loading.hide{display:none}.kline-note{margin-top:9px}@media(max-width:760px){.kline-card{padding:14px}.kline-head{display:block}.kline-actions{margin-top:12px}.kline-canvas-wrap canvas{height:430px}}
+'''
+
 SCRIPT = r'''
 try{localStorage.removeItem('quant_token')}catch(e){}
 function getAdminToken(){try{return sessionStorage.getItem('quant_token')||''}catch(e){return ''}}function setAdminToken(v){try{sessionStorage.setItem('quant_token',v)}catch(e){}}function clearAdminToken(){try{sessionStorage.removeItem('quant_token')}catch(e){}alert('本标签页的管理令牌已清除')}
@@ -1241,6 +1359,23 @@ function dailyOverview(d,rows,meta,scope,core,avgRps){const market=d.market||'�
 function fundamentalPanel(rows){const samples=(rows||[]).slice(0,6).map(r=>`<button class="sample-chip" onclick="queryFundamental('${esc(r.code)}')">${esc(r.code)} ${esc(r.name)}</button>`).join('');return `<section class="card fundamental-panel" id="fundamentals"><div class="category-head"><div><h2>个股基本面查询</h2><p>输入沪深A股六位代码，查看公司概况、最新公开财务指标、估值快照与近五期财报。数据按查询时点短时缓存，不替代公告核验。</p></div><span class="pill">公开数据 · 非投资建议</span></div><div class="fundamental-search"><input id="fund-code" class="fundamental-input" maxlength="6" inputmode="numeric" placeholder="输入股票代码，例如 000938 / 600000" onkeydown="if(event.key==='Enter')queryFundamental()"><button class="btn primary" onclick="queryFundamental()">查询基本面</button><div class="sample-chips">${samples}</div></div><div id="fundamental-result" class="fundamental-result"></div></section>`}
 function fundamentalHtml(d){const c=d.company||{},q=d.quote||{},f=d.latest_finance||{},history=d.finance_history||[],flags=d.assessment||[];const metric=(l,v,sub='')=>`<div class="metric"><div class="label">${esc(l)}</div><div class="value">${esc(v)}</div><div class="small muted">${esc(sub)}</div></div>`;const facts=[['所属行业',c.industry],['上市日期',c.listing_date],['上市板块',c.market_type],['交易所',c.exchange],['所在地区',c.province],['董事长',c.chairman],['法人代表',c.legal_representative],['员工人数',c.employees]].map(x=>`<div class="fact"><b>${esc(x[0])}</b>${esc(x[1]||'-')}</div>`).join('');const flagHtml=flags.map(x=>`<div class="assessment-item ${esc(x.type||'neutral')}"><b>${esc(x.title)}</b>：${esc(x.text)}</div>`).join('')||'<div class="muted small">暂无足够财务字段形成结构提示。</div>';const hist=history.map(x=>`<tr><td>${esc(x.period)}</td><td>${esc(x.type)}</td><td>${money(x.revenue)}</td><td>${pct(x.revenue_yoy)}</td><td>${money(x.net_profit)}</td><td>${pct(x.profit_yoy)}</td><td>${x.roe==null?'-':esc(x.roe)+'%'}</td><td>${x.gross_margin==null?'-':esc(x.gross_margin)+'%'}</td><td>${x.debt_ratio==null?'-':esc(x.debt_ratio)+'%'}</td></tr>`).join('');const warnings=(d.warnings||[]).map(x=>`<span class="badge risk">${esc(x)}</span>`).join(' ');return `<div class="fundamental-title"><div><h3>${esc(d.code)} ${esc(d.name)}</h3><p class="muted small">数据来源：${esc(d.source)}；查询：${esc(d.fetched_at)}${d.cached?'（缓存）':''}</p></div><div>${warnings}</div></div><div class="fundamental-grid">${metric('最新价',q.price==null?'-':q.price,q.pct==null?'':pct(q.pct))}${metric('动态市盈率',q.pe_dynamic==null?'-':q.pe_dynamic,'亏损或缺失时不具可比性')}${metric('市净率',q.pb==null?'-':q.pb,'按数据源口径')}${metric('总市值',money(q.total_market_cap),'流通市值 '+money(q.float_market_cap))}${metric('最近营收',money(f.revenue),esc(f.period||'最近披露期'))}${metric('归母净利润',money(f.net_profit),'同比 '+pct(f.profit_yoy))}${metric('加权ROE',f.roe==null?'-':f.roe+'%','报告期口径，非年化')}${metric('资产负债率',f.debt_ratio==null?'-':f.debt_ratio+'%','金融行业可比性较弱')}</div><div class="fundamental-two"><div><h3>公司概况</h3><div class="facts">${facts}</div></div><div><h3>财务结构提示</h3><div class="assessment">${flagHtml}</div></div></div>${c.business_summary?`<div class="business-summary"><b>公司简介：</b>${esc(c.business_summary)}</div>`:''}<div class="feedback-table" style="margin-top:14px"><h3>近五期公开财务摘要</h3><table><thead><tr><th>报告期</th><th>类型</th><th>营收</th><th>营收同比</th><th>归母净利</th><th>净利同比</th><th>加权ROE</th><th>毛利率</th><th>资产负债率</th></tr></thead><tbody>${hist||'<tr><td colspan="9" class="muted">暂无财务数据</td></tr>'}</tbody></table></div><div class="fundamental-note">${(d.notes||[]).map(esc).join('　')}</div>`}
 async function queryFundamental(raw){const input=document.getElementById('fund-code');const code=(raw||input&&input.value||'').replace(/\D/g,'').slice(0,6);if(input)input.value=code;const el=document.getElementById('fundamental-result');if(!el)return;if(!/^((00|30|60|68)\d{4})$/.test(code)){el.innerHTML='<div class="fundamental-error">请输入沪深A股六位代码，例如 000938、600000 或 688xxx。</div>';return;}el.innerHTML='<div class="fundamental-loading">正在获取公司概况、估值快照和公开财务数据…</div>';try{const r=await fetch('/api/fundamentals?code='+encodeURIComponent(code));const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.message||'查询失败');el.innerHTML=fundamentalHtml(d);el.scrollIntoView({behavior:'smooth',block:'nearest'});}catch(e){el.innerHTML=`<div class="fundamental-error">查询失败：${esc(e.message||'请稍后重试')}</div>`}}
+
+const KLINE_MA_COLORS={5:'#ffd166',10:'#58dcff',20:'#d08cff',60:'#ff9f68'};
+let klineState={code:'',name:'',period:'day',data:null,mas:new Set([5,10,20,60]),request:0};
+function openKline(code){const clean=String(code||'').replace(/\D/g,'').slice(0,6),row=(window.__DATA__.rows||[]).find(x=>String(x.code)===clean);klineState.code=clean;klineState.name=row?.name||'';klineState.period='day';klineState.data=null;document.getElementById('klineModal').classList.add('show');document.getElementById('klineTitle').textContent=`${klineState.code} ${klineState.name} K线图`;document.querySelectorAll('[data-period]').forEach(b=>b.classList.toggle('active',b.dataset.period==='day'));loadKline()}
+function closeKline(){klineState.request++;document.getElementById('klineModal').classList.remove('show')}
+function setKlinePeriod(period){if(!['day','week','month'].includes(period)||period===klineState.period)return;klineState.period=period;document.querySelectorAll('[data-period]').forEach(b=>b.classList.toggle('active',b.dataset.period===period));loadKline()}
+function klineToFundamental(){const code=klineState.code;closeKline();location.hash='fundamentals';setTimeout(()=>queryFundamental(code),50)}
+function klineMaControls(){const box=document.getElementById('klineMa');box.innerHTML=[5,10,20,60].map(n=>`<label class="ma-toggle" style="--ma-color:${KLINE_MA_COLORS[n]}"><input type="checkbox" ${klineState.mas.has(n)?'checked':''} onchange="toggleKlineMa(${n},this.checked)"><span style="color:${KLINE_MA_COLORS[n]}">MA${n}</span></label>`).join('')}
+function toggleKlineMa(n,on){on?klineState.mas.add(n):klineState.mas.delete(n);drawKline()}
+async function loadKline(){const req=++klineState.request,loading=document.getElementById('klineLoading'),canvas=document.getElementById('klineCanvas');loading.textContent='正在加载K线…';loading.classList.remove('hide');document.getElementById('klineInfo').textContent='';klineState.data=null;if(canvas){const c=canvas.getContext('2d');c.clearRect(0,0,canvas.width,canvas.height)}klineMaControls();try{const r=await fetch(`/api/kline?code=${encodeURIComponent(klineState.code)}&period=${encodeURIComponent(klineState.period)}&limit=120`);const d=await r.json();if(req!==klineState.request)return;if(!r.ok||!d.ok)throw new Error(d.message||'K线查询失败');klineState.data=d;klineState.name=d.name||klineState.name;document.getElementById('klineTitle').textContent=`${d.code} ${d.name||''} · ${{day:'日线',week:'周线',month:'月线'}[d.period]}`;document.getElementById('klineMeta').textContent=`${d.source}｜${d.adjust}｜更新 ${d.updated_at}`;document.getElementById('klineNote').textContent=d.note||'红涨绿跌；均线随当前周期计算。';loading.classList.add('hide');drawKline()}catch(e){if(req!==klineState.request)return;loading.textContent=`加载失败：${e.message||'请稍后重试'}`}}
+function klineVol(v){const n=Number(v||0);return n>=1e8?(n/1e8).toFixed(2)+'亿':n>=1e4?(n/1e4).toFixed(1)+'万':n.toFixed(0)}
+function klineRowInfo(r){if(!r)return '';const pct=(r.close/r.open-1)*100;return `${r.date}　开 ${r.open.toFixed(2)}　高 ${r.high.toFixed(2)}　低 ${r.low.toFixed(2)}　收 ${r.close.toFixed(2)}　${pct>=0?'+':''}${pct.toFixed(2)}%　量 ${klineVol(r.volume)}　`+[5,10,20,60].filter(n=>klineState.mas.has(n)&&r['ma'+n]!=null).map(n=>`MA${n} ${Number(r['ma'+n]).toFixed(2)}`).join('　')}
+function paintKlineBase(canvas,c,rows,w,h){c.clearRect(0,0,w,h);const left=58,right=18,top=24,priceBottom=Math.round(h*.72),volTop=priceBottom+24,bottom=h-32,plotW=w-left-right,priceH=priceBottom-top,volH=bottom-volTop;let vals=[];rows.forEach(r=>{vals.push(r.low,r.high);[5,10,20,60].forEach(n=>{if(klineState.mas.has(n)&&r['ma'+n]!=null)vals.push(r['ma'+n])})});let min=Math.min(...vals),max=Math.max(...vals),pad=Math.max((max-min)*.06,max*.005,.01);min-=pad;max+=pad;const py=v=>top+(max-v)/(max-min)*priceH,maxVol=Math.max(...rows.map(r=>r.volume||0),1),step=plotW/rows.length,body=Math.max(2,Math.min(9,step*.62));c.font='11px sans-serif';c.strokeStyle='#17334c';c.fillStyle='#7895ae';c.lineWidth=1;for(let i=0;i<=5;i++){const y=top+priceH*i/5;c.beginPath();c.moveTo(left,y);c.lineTo(w-right,y);c.stroke();const v=max-(max-min)*i/5;c.fillText(v.toFixed(2),5,y+4)}for(let i=0;i<rows.length;i++){const r=rows[i],x=left+step*(i+.5),up=r.close>=r.open,color=up?'#ef5350':'#26a69a';c.strokeStyle=color;c.fillStyle=color;c.beginPath();c.moveTo(x,py(r.high));c.lineTo(x,py(r.low));c.stroke();const y1=py(r.open),y2=py(r.close),bh=Math.max(1,Math.abs(y2-y1));up?c.strokeRect(x-body/2,Math.min(y1,y2),body,bh):c.fillRect(x-body/2,Math.min(y1,y2),body,bh);const vh=(r.volume/maxVol)*volH;c.globalAlpha=.7;c.fillRect(x-body/2,bottom-vh,body,vh);c.globalAlpha=1}for(const n of [5,10,20,60]){if(!klineState.mas.has(n))continue;c.strokeStyle=KLINE_MA_COLORS[n];c.lineWidth=1.35;c.beginPath();let started=false;rows.forEach((r,i)=>{const v=r['ma'+n];if(v==null)return;const x=left+step*(i+.5),y=py(v);started?c.lineTo(x,y):c.moveTo(x,y);started=true});if(started)c.stroke()}c.fillStyle='#7895ae';c.strokeStyle='#17334c';c.lineWidth=1;for(let i=0;i<6;i++){const idx=Math.min(rows.length-1,Math.round(i*(rows.length-1)/5)),x=left+step*(idx+.5);c.fillText(rows[idx].date.slice(2),Math.max(left,x-25),h-10)}c.fillText('成交量',5,volTop+12);return {left,right,top,bottom,step,py}}
+function drawKline(){const d=klineState.data,canvas=document.getElementById('klineCanvas');if(!d||!canvas||!d.rows?.length)return;const rows=d.rows,w=Math.max(620,canvas.clientWidth||1000),h=canvas.clientHeight||560,dpr=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);const latest=rows[rows.length-1];let geom=paintKlineBase(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=klineRowInfo(latest);canvas.onmousemove=e=>{const rect=canvas.getBoundingClientRect(),mx=(e.clientX-rect.left)*w/rect.width,idx=Math.max(0,Math.min(rows.length-1,Math.floor((mx-geom.left)/geom.step)));geom=paintKlineBase(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=klineRowInfo(rows[idx]);drawKlineCross(c,w,geom,idx,rows)};canvas.onmouseleave=()=>{geom=paintKlineBase(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=klineRowInfo(latest)}}
+function drawKlineCross(c,w,geom,idx,rows){const r=rows[idx],x=geom.left+geom.step*(idx+.5),y=geom.py(r.close);c.save();c.setLineDash([4,4]);c.strokeStyle='rgba(210,235,255,.48)';c.beginPath();c.moveTo(x,geom.top);c.lineTo(x,geom.bottom);c.moveTo(geom.left,y);c.lineTo(w-geom.right,y);c.stroke();c.restore()}
+window.addEventListener('resize',()=>{if(document.getElementById('klineModal')?.classList.contains('show'))drawKline()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.getElementById('klineModal')?.classList.contains('show'))closeKline()});
+
 function render(){const d=window.__DATA__, el=document.getElementById('app'); if(!d.has_data){el.innerHTML=`<section class="hero"><div class="title"><span class="eyebrow">A股量化驾驶舱</span><h1>暂无扫描结果</h1><p>${esc(d.message||'')}</p></div><div class="actions"><button class="btn primary" onclick="runScan()">立即运行全市场扫描</button></div></section>${statusHtml(d.run_state)}`;return;}
  const rows=d.rows||[], meta=d.meta||{}, scope=d.scope||{}; const fundamentalBlock=fundamentalPanel(rows); const core=rows.filter(r=>['核心推荐','优先关注'].includes(r.level)).length; const avgBase=rows.filter(r=>parseFloat(r.rps_combo)); const avgRps=Math.round(rows.reduce((a,r)=>a+(parseFloat(r.rps_combo)||0),0)/Math.max(1,avgBase.length)); const feedbackBlock=feedbackHtml(d.feedback); const overviewBlock=dailyOverview(d,rows,meta,scope,core,avgRps);
  const tabs=(d.group_order||['全部']).map(g=>`<button class="tab ${g===active?'active':''}" onclick="active='${g}';activeStrategy='全部';showAllRows=false;render()">${g} <b>${g==='全部'?rows.length:(d.group_counts||{})[g]||0}</b></button>`).join('');
@@ -1248,7 +1383,7 @@ function render(){const d=window.__DATA__, el=document.getElementById('app'); if
  const strategyNav=(d.strategy_book||[]).map(b=>`<div class="strategy-group"><div class="strategy-group-title">${esc(b.group)} · ${esc((b.items||[]).length)} 种</div><div class="strategy-chips">${(b.items||[]).map(it=>{const hit=rows.filter(r=>(r.strategy||'').includes(it)).length; return `<button class="strategy-chip ${activeStrategy===it?'active':''}" onclick="active='${esc(b.group)}';activeStrategy='${esc(it)}';showAllRows=false;render()">${esc(it)}<em>${hit}</em></button>`}).join('')}</div></div>`).join('');
  const filteredBase=rows.filter(rowVisible); const filtered=priorityOnly?filteredBase.filter(r=>['核心推荐','优先关注'].includes(r.level)):filteredBase; const displayRows=showAllRows?filtered:filtered.slice(0,20); const leaders=Object.entries(d.group_top||{}).map(([g,r])=>`<div class="leader-card"><div class="muted small">${esc(g)}</div><b>${esc(r.code)} ${esc(r.name)}</b><div class="small">${esc(r.strategy)}｜规则评分 ${esc(r.score)}｜RPS ${esc(r.rps_combo||'-')}</div><div class="bar"><i style="width:${Math.min(100,parseFloat(r.score)||0)}%"></i></div></div>`).join('');
  const books=(d.strategy_book||[]).map(b=>`<div class="book-item"><div class="pill">${esc(b.group)}</div><div class="items">${esc((b.items||[]).join(' / '))}</div><div class="small muted">规则：${esc(b.rule)}</div><div class="small" style="color:#ffdca0">风控：${esc(b.risk)}</div></div>`).join('');
- const trs=displayRows.map((r,i)=>`<tr><td>${i+1}</td><td><button class="code-link" onclick="queryFundamental('${esc(r.code)}')">${esc(r.code)}</button></td><td>${esc(r.name)}</td><td><span class="badge ${esc(r.level_class)}">${esc(r.level)}</span></td><td>${esc(r.strategy_group)}</td><td>${esc(r.strategy)}</td><td><b>${esc(r.score)}</b></td><td>${esc(r.rps_combo||'-')}</td><td class="detail-col">${esc(r.rps60||'-')}</td><td>${esc(r.close)}</td><td class="detail-col">${esc(r.pct_today)}%</td><td class="detail-col">${esc(r.turnover)}%</td><td>${esc(r.buy_zone)}</td><td>${esc(r.stop_loss)}</td><td class="detail-col">${esc(r.target)}</td><td class="detail-col">${esc(r.risk_reward)}</td><td class="detail-col">${esc(r.risk_tags||'')}</td><td class="detail-col"><span class="exec-stage">${esc(r.execution_stage||'-')}</span></td><td class="reason" title="${esc(r.risk_budget_hint||'')}">${esc(r.action)}</td><td class="reason" title="${esc(r.reason)}">${esc(r.reason)}</td></tr>`).join('');
+ const trs=displayRows.map((r,i)=>`<tr><td>${i+1}</td><td><button class="code-link" title="查看日线、周线、月线和均线" onclick="openKline('${esc(r.code)}')">${esc(r.code)}</button></td><td>${esc(r.name)}</td><td><span class="badge ${esc(r.level_class)}">${esc(r.level)}</span></td><td>${esc(r.strategy_group)}</td><td>${esc(r.strategy)}</td><td><b>${esc(r.score)}</b></td><td>${esc(r.rps_combo||'-')}</td><td class="detail-col">${esc(r.rps60||'-')}</td><td>${esc(r.close)}</td><td class="detail-col">${esc(r.pct_today)}%</td><td class="detail-col">${esc(r.turnover)}%</td><td>${esc(r.buy_zone)}</td><td>${esc(r.stop_loss)}</td><td class="detail-col">${esc(r.target)}</td><td class="detail-col">${esc(r.risk_reward)}</td><td class="detail-col">${esc(r.risk_tags||'')}</td><td class="detail-col"><span class="exec-stage">${esc(r.execution_stage||'-')}</span></td><td class="reason" title="${esc(r.risk_budget_hint||'')}">${esc(r.action)}</td><td class="reason" title="${esc(r.reason)}">${esc(r.reason)}</td></tr>`).join('');
  const autoCfg=(d.watchlist||{}).auto_sync||{}; const quickNav=`<nav class="quick-nav"><div class="quick-links"><a href="#overview">今日总览</a><a href="#fundamentals">个股基本面</a><a href="#strategies">战法导航</a><a href="#feedback">历史反馈</a><a href="#candidates">候选列表</a><a href="/opening">早盘确认</a><a href="/positions">交易复盘</a></div><div class="quick-state"><span>信号日 ${esc(d.date||'-')}</span><span class="${autoCfg.enabled?'on':'off'}">${autoCfg.enabled?'自动监控已开启':'自动监控未开启'}</span><span>监控 ${(d.watchlist||{}).count||0} 只</span></div></nav>`;
  const reports=(d.reports||[]).slice(0,8).map(r=>`<div class="hist-row"><span>${esc(r.date)}｜${r.count}只</span><span class="muted">池:${esc(r.universe_count||'-')} 深筛:${esc(r.kline_scanned_count||'-')} 最高:${esc(r.top_score)}</span></div>`).join('');
  el.innerHTML=`<section class="hero"><div class="title"><span class="eyebrow">A股量化驾驶舱 · ${esc(d.date)}</span><h1>全市场战法分类推荐</h1><p>先看市场环境与执行层级，再看候选；量化排序不是买入指令。</p></div><div class="actions"><a class="btn primary" href="#candidates">查看今日候选</a><a class="btn" href="/opening">开盘建仓确认</a><a class="btn" href="/positions">交易复盘台</a><button class="btn" onclick="document.getElementById('fund-code').focus();location.hash='fundamentals'">查个股基本面</button><button class="btn" onclick="runScan()">手动补跑扫描</button><button class="btn" onclick="showReport()">查看报告</button></div></section>${quickNav}<div id="overview">${overviewBlock}</div>${fundamentalBlock}<section class="card category-panel"><div class="category-head"><div><h2>战法分类导航</h2><p>数字是当日命中该分类的股票数；一只股票可同时命中多个分类，因此分类数量不能相加当作候选总数。</p></div><span class="pill">已收录 ${(d.strategy_book||[]).reduce((n,b)=>n+(b.items||[]).length,0)} 种战法</span></div><div class="category-grid">${categoryCards}</div></section><section class="card strategy-panel ${strategyExpanded?'':'collapsed'}" id="strategies"><div class="category-head"><div><h2>具体战法导航</h2><p>按具体战法筛选当日信号，零命中也会保留，便于确认战法是否上线。</p></div><div class="switches"><button class="filter-btn" onclick="strategyExpanded=!strategyExpanded;render()">${strategyExpanded?'收起战法':'展开18种战法'}</button><button class="filter-btn ${activeStrategy==='全部'?'active':''}" onclick="active='全部';activeStrategy='全部';showAllRows=false;render()">查看全部</button></div></div><div class="strategy-groups">${strategyNav}</div></section><section class="grid"><div><div class="card" id="feedback">${feedbackBlock}</div><div class="card" id="candidates" style="margin-top:16px"><div class="category-head"><div><h2>候选列表</h2><p>默认只展示前20条，先复核核心/优先对象；表头与代码列已固定，横向滚动可看完整风控字段。</p></div><span class="pill">当前 ${filtered.length} 条</span></div><div class="tabs">${tabs}</div><div class="toolbar"><input class="search" placeholder="搜索代码/名称/战法/理由" value="${esc(q)}" oninput="q=this.value;showAllRows=false;render()"><div class="switches"><button class="filter-btn ${priorityOnly?'active':''}" onclick="priorityOnly=!priorityOnly;showAllRows=false;render()">只看核心/优先</button><button class="filter-btn ${showAllRows?'active':''}" onclick="showAllRows=!showAllRows;render()">${showAllRows?'收起到前20':'展示全部'}</button><button class="filter-btn ${compactTable?'active':''}" onclick="compactTable=!compactTable;render()">${compactTable?'决策视图':'完整字段'}</button><span class="pill">显示 ${displayRows.length}/${filtered.length}</span><span class="pill">数据 ${esc(d.signal_file)}</span></div></div><div class="table-wrap"><table class="${compactTable?'compact-table':''}"><thead><tr><th>#</th><th>代码</th><th>名称</th><th>等级</th><th>分类</th><th>战法</th><th>规则评分</th><th>RPS</th><th class="detail-col">RPS60</th><th>收盘</th><th class="detail-col">涨跌</th><th class="detail-col">换手</th><th>买入区间</th><th>止损</th><th class="detail-col">目标</th><th class="detail-col">盈亏比</th><th class="detail-col">风险标签</th><th class="detail-col">执行层级</th><th>执行动作</th><th>理由</th></tr></thead><tbody>${trs||'<tr><td colspan="20" class="muted">当前筛选条件没有候选</td></tr>'}</tbody></table></div></div></div><aside class="side"><div class="card"><h3>分类龙头/组内最高分</h3><div class="leader">${leaders||'<span class="muted">暂无</span>'}</div></div><div class="card"><h3>日常使用顺序</h3><ol class="usage-steps"><li><b>先看市场状态</b>，弱势优先等待。</li><li><b>再看执行层级</b>，不把信号日当买点。</li><li><b>复核基本面</b>，排除明显财务风险。</li><li><b>定义止损和风险预算</b>，避免同题材集中。</li><li><b>每周看历史反馈</b>，不凭一两次结果评价战法。</li></ol></div><div class="card"><h3>运行状态</h3>${statusHtml(d.run_state)}</div><div class="card"><h3>历史扫描</h3><div class="hist">${reports||'<span class="muted">暂无历史</span>'}</div></div></aside></section><div class="footer">免责声明：本系统只做量化候选筛选、基本面信息整理和复盘反馈，不保证收益或胜率，不构成投资建议。任何交易需自行判断并严格止损。</div>`}
@@ -1331,6 +1466,16 @@ class Handler(BaseHTTPRequestHandler):
             allowed,retry=consume_rate(f"trades-get:{self.client_key()}",60,60)
             if not allowed: return self.json({"ok":False,"message":"交易复盘查询过于频繁"},429,{"Retry-After":str(retry)})
             return self.json(trade_journal_payload())
+        if path=="/api/kline":
+            allowed,retry=consume_rate(f"kline:{self.client_key()}",60,300)
+            global_allowed,global_retry=consume_rate("kline:global",300,60)
+            if not allowed or not global_allowed:
+                return self.json({"ok":False,"message":"K线查询过于频繁，请稍后再试"},429,{"Retry-After":str(max(retry,global_retry,1))})
+            try:
+                qs=parse_qs(u.query); code=(qs.get("code") or [""])[0]; period=(qs.get("period") or ["day"])[0]; limit=(qs.get("limit") or ["120"])[0]
+                return self.json(kline_payload(code,period,limit))
+            except ValueError as exc: return self.json({"ok":False,"message":str(exc)},400)
+            except Exception: traceback.print_exc(); return self.json({"ok":False,"message":"K线数据暂不可用，请稍后重试"},503)
         if path=="/api/fundamentals":
             allowed,retry=consume_rate(f"fund:{self.client_key()}",30,300)
             global_allowed,global_retry=consume_rate("fund:global",180,60)

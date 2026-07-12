@@ -75,6 +75,13 @@ class KlineTests(unittest.TestCase):
         self.assertEqual(len(low["rows"]), 40)
         fetch.assert_called_once_with("000001", 100)
 
+    def test_kline_payload_allows_extended_history_up_to_640(self):
+        source = self.bars(700)
+        with mock.patch.object(app, "_chart_daily_bars", return_value=(source, "平安银行", "测试源")) as fetch:
+            result = app.kline_payload("000001", "day", 999)
+        self.assertEqual(len(result["rows"]), 640)
+        fetch.assert_called_once_with("000001", 700)
+
     def test_month_payload_requests_enough_daily_history_for_ma60(self):
         source = self.bars(400)
         with mock.patch.object(app, "_chart_daily_bars", return_value=(source, "平安银行", "测试源")) as fetch:
@@ -92,10 +99,22 @@ class KlineTests(unittest.TestCase):
     def test_page_contains_periods_mas_and_kline_click(self):
         data = {"has_data": True, "rows": [{"code": "000001", "name": "平安银行"}], "watchlist": {}, "group_order": ["全部"], "strategy_book": []}
         html = app.page_html(data)
-        for text in ('id="klineModal"', "日线", "周线", "月线", "function openKline", "[5,10,20,60]", "MA${n}"):
+        for text in ('id="klineModal"', "日线", "周线", "月线", "全屏", "120根", "240根", "480根", "＋ 放大", "－ 缩小", "较早", "较新", "function openKline", "[5,10,20,60]", "MA${n}"):
             self.assertIn(text, html)
         self.assertIn("onclick=\"openKline('${esc(r.code)}')\"", app.SCRIPT)
         self.assertNotIn("openKline('${esc(r.code)}','${esc(r.name)}')", app.SCRIPT)
+
+    def test_kline_modal_stays_above_sticky_navigation(self):
+        self.assertIn("z-index:1000", app.STYLE)
+        self.assertIn("body.kline-open{overflow:hidden}", app.STYLE)
+        self.assertIn("function toggleKlineFullscreen", app.SCRIPT)
+
+    def test_kline_supports_zoom_pan_and_dynamic_history_limit(self):
+        self.assertIn("function setKlineLimit(limit)", app.SCRIPT)
+        self.assertIn("function zoomKline(factor)", app.SCRIPT)
+        self.assertIn("function panKline(direction)", app.SCRIPT)
+        self.assertIn("limit=${klineState.limit}", app.SCRIPT)
+        self.assertIn("canvas.onwheel", app.SCRIPT)
 
     def test_crosshair_repaints_base_before_drawing(self):
         self.assertIn("geom=paintKlineBase(canvas,c,rows,w,h);document.getElementById('klineInfo')", app.SCRIPT)

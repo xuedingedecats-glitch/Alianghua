@@ -96,10 +96,67 @@ class WebSecurityTests(unittest.TestCase):
             "checked_at": "2026-07-10 09:45:00", "message": "测试",
         }
         page = app.opening_page_html(payload)
-        for text in ("riskCapital", "riskPct", "maxPosPct", "exportOpeningCsv", "仓位预案", "最近自动核验轨迹"):
+        for text in ("riskCapital", "riskPct", "maxPosPct", "portfolioPct", "portfolioRiskPct", "portfolioSummary", "buildPortfolioPlans", "exportOpeningCsv", "仓位预案", "最近自动核验轨迹"):
             self.assertIn(text, page)
         self.assertIn("sessionStorage.setItem('opening_risk_settings'", page)
         self.assertNotIn("胜率优先", page)
+
+
+    def test_opening_session_only_allows_early_morning_window(self):
+        cases = [
+            (dt.datetime(2026, 7, 13, 9, 32), False, "auction"),
+            (dt.datetime(2026, 7, 13, 10, 0), True, "morning"),
+            (dt.datetime(2026, 7, 13, 14, 0), False, "afternoon"),
+        ]
+        for current, active, mode in cases:
+            with self.subTest(current=current), mock.patch.object(app, "now_cn", return_value=current):
+                result = app.opening_session()
+                self.assertEqual(result["active"], active)
+                self.assertEqual(result["mode"], mode)
+
+    def test_opening_rejects_signal_older_than_fourteen_days(self):
+        current = dt.datetime(2026, 7, 20, 10, 0)
+        with tempfile.TemporaryDirectory() as td:
+            report_dir = Path(td)
+            signal = report_dir / "signals_20260701.csv"
+            signal.write_text("code,date,score,buy_zone,stop_loss\n000001,2026-07-01,80,10~11,9.5\n", encoding="utf-8")
+            session = {"active": True, "mode": "morning", "label": "早盘核验窗口", "time": "", "next_action": ""}
+            empty_watch = {"codes": [], "count": 0, "max": 100, "items": [], "auto_sync": {}}
+            with mock.patch.object(app, "REPORT_DIR", report_dir), mock.patch.object(app, "now_cn", return_value=current), mock.patch.object(app, "opening_session", return_value=session), mock.patch.object(app, "watchlist_payload", return_value=empty_watch), mock.patch.object(app, "fetch_live_quote") as fetch:
+                result = app.opening_check_payload()
+            self.assertFalse(result["ok"])
+            self.assertIn("超过安全时效", result["message"])
+            fetch.assert_not_called()
+
+    def test_opening_refresh_is_single_flight(self):
+        current = dt.datetime(2026, 7, 13, 10, 0)
+        with tempfile.TemporaryDirectory() as td:
+            report_dir = Path(td)
+            signal = report_dir / "signals_20260710.csv"
+            signal.write_text("code,date,score,buy_zone,stop_loss\n000001,2026-07-10,80,10~11,9.5\n", encoding="utf-8")
+            session = {"active": True, "mode": "morning", "label": "早盘核验窗口", "time": "", "next_action": ""}
+            empty_watch = {"codes": [], "count": 0, "max": 100, "items": [], "auto_sync": {}}
+            app.OPENING_REFRESH_LOCK.acquire()
+            try:
+                with mock.patch.object(app, "REPORT_DIR", report_dir), mock.patch.object(app, "now_cn", return_value=current), mock.patch.object(app, "opening_session", return_value=session), mock.patch.object(app, "watchlist_payload", return_value=empty_watch), mock.patch.object(app, "fetch_live_quote") as fetch:
+                    result = app.opening_check_payload()
+            finally:
+                app.OPENING_REFRESH_LOCK.release()
+            self.assertTrue(result.get("refreshing"))
+            fetch.assert_not_called()
+
+    def test_opening_snapshot_is_written_atomically(self):
+        with tempfile.TemporaryDirectory() as td:
+            report_dir = Path(td)
+            with mock.patch.object(app, "REPORT_DIR", report_dir):
+                saved = app.save_opening_check({"rows": [{"code": "000001"}], "summary": {"total": 1}})
+            self.assertIsNotNone(saved)
+            self.assertTrue(saved.exists())
+            self.assertFalse(saved.with_suffix(".tmp").exists())
+
+    def test_public_bind_requires_management_token(self):
+        with mock.patch.object(app, "WEB_TOKEN", ""), mock.patch("sys.argv", ["app.py", "--host", "0.0.0.0", "--no-scheduler"]):
+            self.assertEqual(app.main(), 3)
 
 
 if __name__ == "__main__":

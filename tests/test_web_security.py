@@ -56,6 +56,19 @@ class WebSecurityTests(unittest.TestCase):
         self.assertNotIn("localStorage.setItem('quant_token'", html)
 
 
+    def test_homepage_includes_candidate_comparison_and_risk_budget_tools(self):
+        page = app.page_html({"has_data": False, "watchlist": {}})
+        for marker in (
+            'id="compareModal"',
+            'id="budgetModal"',
+            'openCandidateCompare',
+            'openRiskBudget',
+            'renderRiskBudget',
+            '对比已勾选',
+            '风险预算',
+        ):
+            self.assertIn(marker, page)
+
     def test_opening_history_reads_valid_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
             report_dir = Path(td)

@@ -55,6 +55,29 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("sessionStorage.getItem('quant_token')", html)
         self.assertNotIn("localStorage.setItem('quant_token'", html)
 
+    def test_next_weekday_schedule_skips_weekend(self):
+        current = dt.datetime(2026, 7, 10, 22, 0)  # Friday evening
+        self.assertEqual(app.next_weekday_schedule("15:35,21:00", current), "2026-07-13 15:35")
+
+    def test_restore_scan_outputs_keeps_prior_effective_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            report_dir = Path(td)
+            ymd = "20260713"
+            signal = report_dir / f"signals_{ymd}.csv"
+            report = report_dir / f"report_{ymd}.md"
+            signal.write_text("old-effective", encoding="utf-8")
+            report.write_text("old-report", encoding="utf-8")
+            with mock.patch.object(app, "REPORT_DIR", report_dir):
+                snapshot = app.snapshot_scan_outputs(ymd)
+                signal.write_text("stale-new", encoding="utf-8")
+                (report_dir / f"meta_{ymd}.json").write_text('{"stale":true}', encoding="utf-8")
+                (report_dir / f"feedback_20260710_asof_{ymd}.csv").write_text("stale-feedback", encoding="utf-8")
+                app.restore_scan_outputs(ymd, snapshot)
+            self.assertEqual(signal.read_text(encoding="utf-8"), "old-effective")
+            self.assertEqual(report.read_text(encoding="utf-8"), "old-report")
+            self.assertFalse((report_dir / f"meta_{ymd}.json").exists())
+            self.assertFalse((report_dir / f"feedback_20260710_asof_{ymd}.csv").exists())
+
 
     def test_homepage_includes_candidate_comparison_and_risk_budget_tools(self):
         page = app.page_html({"has_data": False, "watchlist": {}})
@@ -68,6 +91,8 @@ class WebSecurityTests(unittest.TestCase):
             '风险预算',
         ):
             self.assertIn(marker, page)
+        self.assertIn("下次计划", page)
+        self.assertIn("数据校验", page)
 
     def test_opening_history_reads_valid_snapshot(self):
         with tempfile.TemporaryDirectory() as td:

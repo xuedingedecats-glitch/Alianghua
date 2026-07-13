@@ -18,6 +18,7 @@ ENGINE = BASE_DIR / "a_share_daily.py"
 REPORT_DIR = DATA_DIR / "a_share_daily_reports"
 LOG_DIR = DATA_DIR / "logs"
 REPORT_DIR.mkdir(parents=True, exist_ok=True); LOG_DIR.mkdir(parents=True, exist_ok=True)
+RUN_STATE_FILE = DATA_DIR / "scan_state.json"
 
 DEFAULT_SCHEDULE = os.environ.get("QUANT_WEB_SCHEDULE", "15:35,21:00")
 OPENING_SCHEDULE = os.environ.get("QUANT_WEB_OPENING_SCHEDULE", "09:35,09:50,10:15,10:30")
@@ -57,7 +58,11 @@ AUTO_SYNC_MAX_FAILURE_RATE = max(0.0, min(float(os.environ.get("QUANT_WEB_AUTO_S
 MAX_CONCURRENT_REQUESTS = max(8, min(int(os.environ.get("QUANT_WEB_MAX_CONCURRENT_REQUESTS", "64")), 256))
 
 RUN_LOCK = threading.Lock()
-RUN_STATE: Dict[str, Any] = {"running": False, "last_started": None, "last_finished": None, "last_returncode": None, "last_log": None, "last_error": None}
+RUN_STATE: Dict[str, Any] = {
+    "running": False, "last_started": None, "last_finished": None, "last_returncode": None,
+    "last_log": None, "last_error": None, "last_trigger": None, "last_effective": None,
+    "last_data_quality": None, "last_auto_sync": None,
+}
 OPENING_RUN_STATE: Dict[str, Any] = {"running": False, "last_started": None, "last_finished": None, "last_error": None, "last_file": None}
 RATE_LOCK = threading.Lock()
 RATE_BUCKETS: Dict[str, List[float]] = {}
@@ -116,6 +121,139 @@ def public_run_state(state: Dict[str, Any], lock: Optional[threading.Lock] = Non
         if out.get(key):
             out[key] = Path(str(out[key])).name
     return out
+
+
+RUN_STATE_KEYS = tuple(RUN_STATE.keys())
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Write small state files atomically so a restart never observes half JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
+
+
+def _persist_run_state(snapshot: Dict[str, Any]) -> None:
+    try:
+        _atomic_write_json(RUN_STATE_FILE, {key: snapshot.get(key) for key in RUN_STATE_KEYS})
+    except OSError:
+        # Status persistence is observability only; it must not stop a scan.
+        pass
+
+
+def update_run_state(**changes: Any) -> Dict[str, Any]:
+    """Update runtime state and retain a safe summary across service restarts."""
+    with RUN_LOCK:
+        RUN_STATE.update(changes)
+        snapshot = dict(RUN_STATE)
+    _persist_run_state(snapshot)
+    return snapshot
+
+
+def restore_run_state() -> None:
+    """Restore only the known fields written by this process; ignore malformed files."""
+    try:
+        if not RUN_STATE_FILE.exists() or RUN_STATE_FILE.stat().st_size > 128 * 1024:
+            return
+        raw = json.loads(RUN_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+        restored = {key: raw.get(key) for key in RUN_STATE_KEYS if key in raw}
+        # A process cannot still be scanning after it has restarted.
+        restored["running"] = False
+        with RUN_LOCK:
+            RUN_STATE.update(restored)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return
+
+
+def parse_schedule_times(schedule: str) -> List[Tuple[int, int]]:
+    times: List[Tuple[int, int]] = []
+    for item in schedule.split(","):
+        item = item.strip()
+        if not re.match(r"^\d{1,2}:\d{2}$", item):
+            continue
+        hour, minute = (int(part) for part in item.split(":"))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            times.append((hour, minute))
+    return sorted(set(times))
+
+
+def next_weekday_schedule(schedule: str, current: Optional[dt.datetime] = None) -> Optional[str]:
+    """Return the next configured weekday trigger; statutory holidays still need data validation."""
+    current = current or now_cn()
+    for offset in range(0, 9):
+        date = (current + dt.timedelta(days=offset)).date()
+        if date.weekday() >= 5:
+            continue
+        for hour, minute in parse_schedule_times(schedule):
+            candidate = dt.datetime.combine(date, dt.time(hour, minute))
+            if candidate > current:
+                return candidate.strftime("%Y-%m-%d %H:%M")
+    return None
+
+
+def scan_status_payload() -> Dict[str, Any]:
+    signal = latest_signal_file()
+    signal_date = date_from_signal(signal) if signal else ""
+    quality = signal_data_quality(signal, require_today=False) if signal else {"ok": False, "reason": "暂无扫描报告"}
+    return {
+        "ok": True,
+        "now": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+        "schedule": DEFAULT_SCHEDULE,
+        "next_scheduled": next_weekday_schedule(DEFAULT_SCHEDULE),
+        "holiday_note": "定时器按工作日触发；法定休市日会由行情日期质量校验拦截，不会自动同步到早盘监控。",
+        "run_state": public_run_state(RUN_STATE, RUN_LOCK),
+        "latest_signal": signal.name if signal else None,
+        "latest_signal_date": f"{signal_date[:4]}-{signal_date[4:6]}-{signal_date[6:]}" if len(signal_date) == 8 else signal_date,
+        "data_quality": quality,
+    }
+
+
+def scan_output_paths(ymd: str) -> List[Path]:
+    """Files produced for one scan date that must be restored if output is stale."""
+    fixed = [
+        REPORT_DIR / f"signals_{ymd}.csv",
+        REPORT_DIR / f"report_{ymd}.md",
+        REPORT_DIR / f"meta_{ymd}.json",
+    ]
+    return fixed + sorted(REPORT_DIR.glob(f"feedback_*_asof_{ymd}.csv"))
+
+
+def snapshot_scan_outputs(ymd: str) -> Dict[str, bytes]:
+    """Keep the prior same-day effective output while an evening retry is running."""
+    snapshot: Dict[str, bytes] = {}
+    for path in scan_output_paths(ymd):
+        try:
+            if path.is_file() and path.stat().st_size <= 12 * 1024 * 1024:
+                snapshot[path.name] = path.read_bytes()
+        except OSError:
+            continue
+    return snapshot
+
+
+def restore_scan_outputs(ymd: str, snapshot: Dict[str, bytes]) -> None:
+    """Remove ineffective new output and restore the last effective same-day output."""
+    current = {path.name: path for path in scan_output_paths(ymd)}
+    for name, path in current.items():
+        if name not in snapshot:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    for name, content in snapshot.items():
+        path = REPORT_DIR / name
+        try:
+            temp = path.with_suffix(path.suffix + ".restore.tmp")
+            temp.write_bytes(content)
+            temp.replace(path)
+        except OSError:
+            pass
+
+
+restore_run_state()
+
 
 def read_csv_dict(path: Path) -> List[Dict[str, Any]]:
     if not path.exists(): return []
@@ -1550,7 +1688,7 @@ def recommendation_text(rows: List[Dict[str, Any]], market: str) -> str:
 def load_latest_payload() -> Dict[str, Any]:
     signal=latest_signal_file()
     if not signal:
-        return {"has_data": False, "message": "暂无报告，请点击“立即运行全市场扫描”。", "run_state": public_run_state(RUN_STATE, RUN_LOCK), "reports": all_reports(), "feedback": feedback_overview(), "group_order": GROUP_ORDER, "strategy_book": STRATEGY_BOOK, "schedule": DEFAULT_SCHEDULE, "watchlist": watchlist_payload()}
+        return {"has_data": False, "message": "暂无报告，请点击“立即运行全市场扫描”。", "run_state": public_run_state(RUN_STATE, RUN_LOCK), "scan_status": scan_status_payload(), "reports": all_reports(), "feedback": feedback_overview(), "group_order": GROUP_ORDER, "strategy_book": STRATEGY_BOOK, "schedule": DEFAULT_SCHEDULE, "watchlist": watchlist_payload()}
     ymd=date_from_signal(signal); rows=read_csv_dict(signal); rows.sort(key=lambda r: safe_float(r.get("score")), reverse=True)
     # 旧版 CSV 不含执行字段，先加载当日元数据再做兼容补齐。
     meta=meta_for_date(ymd); report=report_for_date(ymd); report_text=report.read_text(encoding="utf-8") if report else ""
@@ -1582,44 +1720,62 @@ def load_latest_payload() -> Dict[str, Any]:
         "text": "全市场基础过滤后扫描：沪深主板/创业板/科创板全部先进入基础池，再排除ST、退市、新股、低流动性/低市值/极端换手，最后逐只抓K线做战法深筛。",
         "spot_count": meta.get("spot_count"), "universe_count": meta.get("universe_count"), "kline_scanned_count": meta.get("kline_scanned_count"), "failed_count": meta.get("failed_count", len(meta.get("errors", []))), "data_quality": quality, "execution_policy": meta.get("execution_policy", "候选信号需等待下一交易日价格条件确认，不构成直接交易指令。"),
     }
-    return {"has_data": True, "date": f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}" if len(ymd)==8 else ymd, "rows": rows, "top": rows[:12], "recommendation": recommendation_text(rows, market), "market": market, "group_counts": group_counts, "group_top": group_top, "group_order": GROUP_ORDER, "strategy_book": STRATEGY_BOOK, "scope": scope, "meta": meta, "signal_file": signal.name, "report_file": report.name if report else None, "report_excerpt": report_text[:12000], "run_state": public_run_state(RUN_STATE, RUN_LOCK), "reports": all_reports(), "feedback": feedback_overview(), "schedule": DEFAULT_SCHEDULE, "watchlist": watchlist_payload()}
+    return {"has_data": True, "date": f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}" if len(ymd)==8 else ymd, "rows": rows, "top": rows[:12], "recommendation": recommendation_text(rows, market), "market": market, "group_counts": group_counts, "group_top": group_top, "group_order": GROUP_ORDER, "strategy_book": STRATEGY_BOOK, "scope": scope, "meta": meta, "signal_file": signal.name, "report_file": report.name if report else None, "report_excerpt": report_text[:12000], "run_state": public_run_state(RUN_STATE, RUN_LOCK), "scan_status": scan_status_payload(), "reports": all_reports(), "feedback": feedback_overview(), "schedule": DEFAULT_SCHEDULE, "watchlist": watchlist_payload()}
 
-def run_scan_background(top:int=DEFAULT_TOP,max_stocks:int=DEFAULT_MAX_STOCKS,full:bool=DEFAULT_FULL,workers:int=DEFAULT_WORKERS)->bool:
+def run_scan_background(top:int=DEFAULT_TOP,max_stocks:int=DEFAULT_MAX_STOCKS,full:bool=DEFAULT_FULL,workers:int=DEFAULT_WORKERS,trigger:str="手动补跑")->bool:
+    started = now_cn()
     with RUN_LOCK:
         if RUN_STATE.get("running"): return False
-        RUN_STATE.update({"running":True,"last_started":now_cn().strftime("%Y-%m-%d %H:%M:%S"),"last_finished":None,"last_returncode":None,"last_error":None})
-        def target():
-            log_path=LOG_DIR/f"scan_{now_cn().strftime('%Y%m%d_%H%M%S')}.log"
-            with RUN_LOCK: RUN_STATE["last_log"]=str(log_path)
-            cmd=[sys.executable,str(ENGINE),"--top",str(top),"--workers",str(workers)]
-            if full: cmd.append("--full")
-            else: cmd += ["--max-stocks",str(max_stocks)]
+        RUN_STATE.update({
+            "running": True, "last_started": started.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_finished": None, "last_returncode": None, "last_error": None,
+            "last_trigger": trigger, "last_effective": None, "last_data_quality": None,
+            "last_auto_sync": None,
+        })
+        state_snapshot = dict(RUN_STATE)
+    _persist_run_state(state_snapshot)
+    run_ymd = started.strftime("%Y%m%d")
+    previous_output = snapshot_scan_outputs(run_ymd)
+    def target():
+        log_path=LOG_DIR/f"scan_{now_cn().strftime('%Y%m%d_%H%M%S')}.log"
+        update_run_state(last_log=str(log_path))
+        cmd=[sys.executable,str(ENGINE),"--top",str(top),"--workers",str(workers)]
+        if full: cmd.append("--full")
+        else: cmd += ["--max-stocks",str(max_stocks)]
+        try:
+            with log_path.open("w",encoding="utf-8") as log:
+                log.write("CMD: "+" ".join(cmd)+"\n\n"); log.flush()
+                p=subprocess.run(cmd,cwd=str(BASE_DIR),stdout=log,stderr=subprocess.STDOUT,text=True,timeout=60*120)
+            if p.returncode != 0:
+                # A failed retry must never leave partial current-day reports in front of the prior valid output.
+                restore_scan_outputs(run_ymd, previous_output)
+                update_run_state(last_returncode=p.returncode, last_effective=False, last_error=f"扫描退出码 {p.returncode}，已保留上次有效候选；请查看 {log_path.name}")
+                return
+            signal = latest_signal_file()
+            quality = signal_data_quality(signal, require_today=True) if signal else {"ok": False, "reason": "扫描未生成信号文件"}
+            if not quality.get("ok"):
+                restore_scan_outputs(run_ymd, previous_output)
+                update_run_state(
+                    last_returncode=0, last_effective=False, last_data_quality=quality,
+                    last_error=f"扫描完成但数据质量未通过：{quality.get('reason', '未知原因')}；已保留上次有效候选，未自动同步早盘监控。",
+                )
+                return
+            sync_result = sync_auto_watchlist()
+            update_run_state(last_returncode=0, last_effective=True, last_data_quality=quality, last_auto_sync=sync_result)
+        except Exception as e:
+            restore_scan_outputs(run_ymd, previous_output)
             try:
-                with log_path.open("w",encoding="utf-8") as log:
-                    log.write("CMD: "+" ".join(cmd)+"\n\n"); log.flush()
-                    p=subprocess.run(cmd,cwd=str(BASE_DIR),stdout=log,stderr=subprocess.STDOUT,text=True,timeout=60*120)
-                with RUN_LOCK:
-                    RUN_STATE["last_returncode"]=p.returncode
-                    if p.returncode!=0:
-                        RUN_STATE["last_error"]=f"扫描退出码 {p.returncode}，请查看 {log_path}"
-                if p.returncode==0:
-                    sync_result = sync_auto_watchlist()
-                    with RUN_LOCK: RUN_STATE["last_auto_sync"] = sync_result
-            except Exception as e:
-                with RUN_LOCK:
-                    RUN_STATE["last_returncode"]=-1; RUN_STATE["last_error"]=f"{type(e).__name__}: {e}"
-                with log_path.open("a",encoding="utf-8") as log: log.write("\nERROR:\n"+traceback.format_exc())
-            finally:
-                with RUN_LOCK:
-                    RUN_STATE["running"]=False; RUN_STATE["last_finished"]=now_cn().strftime("%Y-%m-%d %H:%M:%S")
-        threading.Thread(target=target,name="quant-scan",daemon=True).start(); return True
+                with log_path.open("a",encoding="utf-8") as log:
+                    log.write("\nERROR:\n"+traceback.format_exc())
+            except OSError:
+                pass
+            update_run_state(last_returncode=-1, last_effective=False, last_error=f"{type(e).__name__}: {e}；已保留上次有效候选")
+        finally:
+            update_run_state(running=False, last_finished=now_cn().strftime("%Y-%m-%d %H:%M:%S"))
+    threading.Thread(target=target,name="quant-scan",daemon=True).start(); return True
 
 def scheduler_loop(schedule:str):
-    times=[]
-    for item in schedule.split(','):
-        item=item.strip()
-        if re.match(r"^\d{1,2}:\d{2}$", item):
-            h,m=item.split(':'); times.append((int(h),int(m)))
+    times = parse_schedule_times(schedule)
     last=""
     while True:
         try:
@@ -1628,7 +1784,7 @@ def scheduler_loop(schedule:str):
                 for h,m in times:
                     if n.hour==h and n.minute==m:
                         key=f"{n.date()} {h:02d}:{m:02d}"
-                        if key!=last: last=key; run_scan_background()
+                        if key!=last: last=key; run_scan_background(trigger="自动定时")
             time.sleep(20)
         except Exception: time.sleep(60)
 
@@ -1964,7 +2120,7 @@ function render(){const d=window.__DATA__, el=document.getElementById('app'); if
  const autoCfg=(d.watchlist||{}).auto_sync||{}; const quickNav=`<nav class="quick-nav"><div class="quick-links"><a href="#overview">今日总览</a><a href="#fundamentals">个股基本面</a><a href="#strategies">战法导航</a><a href="#feedback">历史反馈</a><a href="#candidates">候选列表</a><a href="/opening">早盘确认</a><a href="/positions">交易复盘</a></div><div class="quick-state"><span>信号日 ${esc(d.date||'-')}</span><span class="${autoCfg.enabled?'on':'off'}">${autoCfg.enabled?'自动监控已开启':'自动监控未开启'}</span><span>监控 ${(d.watchlist||{}).count||0} 只</span></div></nav>`;
  const reports=(d.reports||[]).slice(0,8).map(r=>`<div class="hist-row"><span>${esc(r.date)}｜${r.count}只</span><span class="muted">池:${esc(r.universe_count||'-')} 深筛:${esc(r.kline_scanned_count||'-')} 最高:${esc(r.top_score)}</span></div>`).join('');
  el.innerHTML=`<section class="hero"><div class="title"><span class="eyebrow">A股量化驾驶舱 · ${esc(d.date)}</span><h1>全市场战法分类推荐</h1><p>先看市场环境与执行层级，再看候选；量化排序不是买入指令。</p></div><div class="actions"><a class="btn primary" href="#candidates">查看今日候选</a><a class="btn" href="/opening">开盘建仓确认</a><a class="btn" href="/positions">交易复盘台</a><button class="btn" onclick="document.getElementById('fund-code').focus();location.hash='fundamentals'">查个股基本面</button><button class="btn" onclick="runScan()">手动补跑扫描</button><button class="btn" onclick="showReport()">查看报告</button></div></section>${quickNav}<div id="overview">${overviewBlock}</div>${fundamentalBlock}<section class="card category-panel"><div class="category-head"><div><h2>战法分类导航</h2><p>数字是当日命中该分类的股票数；一只股票可同时命中多个分类，因此分类数量不能相加当作候选总数。</p></div><span class="pill">已收录 ${(d.strategy_book||[]).reduce((n,b)=>n+(b.items||[]).length,0)} 种战法</span></div><div class="category-grid">${categoryCards}</div></section><section class="card strategy-panel ${strategyExpanded?'':'collapsed'}" id="strategies"><div class="category-head"><div><h2>具体战法导航</h2><p>按具体战法筛选当日信号，零命中也会保留，便于确认战法是否上线。</p></div><div class="switches"><button class="filter-btn" onclick="strategyExpanded=!strategyExpanded;render()">${strategyExpanded?'收起战法':'展开18种战法'}</button><button class="filter-btn ${activeStrategy==='全部'?'active':''}" onclick="active='全部';activeStrategy='全部';showAllRows=false;render()">查看全部</button></div></div><div class="strategy-groups">${strategyNav}</div></section><section class="grid"><div><div class="card" id="feedback">${feedbackBlock}</div><div class="card" id="candidates" style="margin-top:16px"><div class="category-head"><div><h2>候选列表</h2><p>默认只展示前20条，先复核核心/优先对象；表头与代码列已固定，横向滚动可看完整风控字段。</p></div><span class="pill">当前 ${filtered.length} 条</span></div><div class="tabs">${tabs}</div><div class="toolbar"><input class="search" placeholder="搜索代码/名称/战法/理由" value="${esc(q)}" oninput="q=this.value;showAllRows=false;render()"><div class="switches"><button class="filter-btn ${priorityOnly?'active':''}" onclick="priorityOnly=!priorityOnly;showAllRows=false;render()">只看核心/优先</button><button class="filter-btn ${showAllRows?'active':''}" onclick="showAllRows=!showAllRows;render()">${showAllRows?'收起到前20':'展示全部'}</button><button class="filter-btn ${compactTable?'active':''}" onclick="compactTable=!compactTable;render()">${compactTable?'决策视图':'完整字段'}</button><span class="pill">显示 ${displayRows.length}/${filtered.length}</span><span class="pill">数据 ${esc(d.signal_file)}</span></div></div><div class="table-wrap"><table class="${compactTable?'compact-table':''}"><thead><tr><th>#</th><th>代码</th><th>名称</th><th>等级</th><th>分类</th><th>战法</th><th>规则评分</th><th>RPS</th><th class="detail-col">RPS60</th><th>收盘</th><th class="detail-col">涨跌</th><th class="detail-col">换手</th><th>买入区间</th><th>止损</th><th class="detail-col">目标</th><th class="detail-col">盈亏比</th><th class="detail-col">风险标签</th><th class="detail-col">执行层级</th><th>执行动作</th><th>理由</th></tr></thead><tbody>${trs||'<tr><td colspan="20" class="muted">当前筛选条件没有候选</td></tr>'}</tbody></table></div></div></div><aside class="side"><div class="card"><h3>分类龙头/组内最高分</h3><div class="leader">${leaders||'<span class="muted">暂无</span>'}</div></div><div class="card"><h3>日常使用顺序</h3><ol class="usage-steps"><li><b>先看市场状态</b>，弱势优先等待。</li><li><b>再看执行层级</b>，不把信号日当买点。</li><li><b>复核基本面</b>，排除明显财务风险。</li><li><b>定义止损和风险预算</b>，避免同题材集中。</li><li><b>每周看历史反馈</b>，不凭一两次结果评价战法。</li></ol></div><div class="card"><h3>运行状态</h3>${statusHtml(d.run_state)}</div><div class="card"><h3>历史扫描</h3><div class="hist">${reports||'<span class="muted">暂无历史</span>'}</div></div></aside></section><div class="footer">免责声明：本系统只做量化候选筛选、基本面信息整理和复盘反馈，不保证收益或胜率，不构成投资建议。任何交易需自行判断并严格止损。</div>`}
-function statusHtml(s){s=s||{};return `<div class="small"><div>状态：<b>${s.running?'运行中':'空闲'}</b></div><div>开始：${esc(s.last_started||'-')}</div><div>结束：${esc(s.last_finished||'-')}</div><div>退出码：${esc(s.last_returncode??'-')}</div><div class="muted">日志：${esc(s.last_log||'-')}</div><div style="color:#ff9b9b">${esc(s.last_error||'')}</div></div>`}
+function statusHtml(s){s=s||{};const scan=window.__DATA__?.scan_status||{},quality=scan.data_quality||{},effective=s.last_effective;const state=s.running?'运行中':(effective===false?'已保留旧结果':'空闲');const dataText=quality.ok?'通过':(quality.reason||'待检查');return `<div class="small"><div>状态：<b>${state}</b></div><div>触发：${esc(s.last_trigger||'-')}</div><div>开始：${esc(s.last_started||'-')}</div><div>结束：${esc(s.last_finished||'-')}</div><div>下次计划：${esc(scan.next_scheduled||'-')}</div><div>数据校验：<b style="color:${quality.ok?'#74f0b9':'#ffd166'}">${esc(dataText)}</b></div><div>有效候选：${effective===true?'已更新':(effective===false?'已保留上一份':'-')}</div><div>退出码：${esc(s.last_returncode??'-')}</div><div class="muted">日志：${esc(s.last_log||'-')}</div><div style="color:#ff9b9b">${esc(s.last_error||'')}</div></div>`}
 async function runScan(){let url='/api/run?full=1&top=80';const token=getAdminToken();const opt={method:'POST',headers:{}};if(token)opt.headers['X-Quant-Token']=token;const r=await fetch(url,opt);if(r.status===401){const t=prompt('请输入扫描令牌');if(t){setAdminToken(t);return runScan();}return;}const d=await r.json();alert(d.message||'已提交');setTimeout(()=>location.reload(),1600)}
 
 function monitorRowCode(row){const direct=(row.querySelector('.code-link')?.textContent||'').trim();if(/^(?:00|30|60|68)\d{4}$/.test(direct))return direct;const m=(row.innerText||'').match(/(?:^|\s)((?:00|30|60|68)\d{4})(?=\s|$)/);return m?m[1]:''}
@@ -2089,6 +2245,10 @@ class Handler(BaseHTTPRequestHandler):
                 traceback.print_exc()
                 return self.json({"ok": False, "message": "基本面数据暂不可用，请稍后重试"}, 503)
         if path=="/healthz": return self.json({"ok":True,"service":"quant-web","time":now_cn().strftime("%Y-%m-%d %H:%M:%S"),"scan_running":bool(public_run_state(RUN_STATE, RUN_LOCK).get("running"))})
+        if path=="/api/status":
+            allowed,retry=consume_rate(f"status:{self.client_key()}",60,60)
+            if not allowed: return self.json({"ok":False,"message":"状态查询过于频繁"},429,{"Retry-After":str(retry)})
+            return self.json(scan_status_payload())
         if path=="/api/latest": return self.json(load_latest_payload())
         if path=="/api/opening":
             allowed,retry=consume_rate(f"opening:{self.client_key()}",60,60)
@@ -2155,7 +2315,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 qs=parse_qs(u.query); top=max(1,min(200,int((qs.get("top") or [DEFAULT_TOP])[0]))); max_stocks=max(1,min(6000,int((qs.get("max_stocks") or [DEFAULT_MAX_STOCKS])[0]))); full=(qs.get("full") or ["1" if DEFAULT_FULL else "0"])[0].lower() in ("1","true","yes"); workers=max(1,min(32,int((qs.get("workers") or [DEFAULT_WORKERS])[0])))
             except (TypeError,ValueError): return self.json({"ok":False,"message":"扫描参数无效"},400)
-            ok=run_scan_background(top=top,max_stocks=max_stocks,full=full,workers=workers)
+            ok=run_scan_background(top=top,max_stocks=max_stocks,full=full,workers=workers,trigger="手动补跑")
             return self.json({"ok":ok,"message":"已开始后台全市场扫描，完成后刷新查看。" if ok else "已有扫描正在运行。","state":public_run_state(RUN_STATE, RUN_LOCK)})
         return self.send_error(404,"not found")
 
@@ -2196,7 +2356,7 @@ def main()->int:
     if not WEB_TOKEN and args.host not in ("127.0.0.1","localhost","::1"):
         print("拒绝在未配置 QUANT_WEB_TOKEN 时监听公网地址；本地测试请使用 --host 127.0.0.1。",file=sys.stderr)
         return 3
-    if args.run_on_start and not latest_signal_file(): run_scan_background()
+    if args.run_on_start and not latest_signal_file(): run_scan_background(trigger="启动补跑")
     if not args.no_scheduler:
         threading.Thread(target=scheduler_loop,args=(DEFAULT_SCHEDULE,),daemon=True).start()
         threading.Thread(target=opening_scheduler_loop,args=(OPENING_SCHEDULE,),daemon=True).start()

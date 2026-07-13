@@ -38,6 +38,9 @@ KLINE_CACHE_TTL = int(os.environ.get("QUANT_WEB_KLINE_CACHE_TTL", "300"))
 KLINE_ACTIVE_CACHE_TTL = int(os.environ.get("QUANT_WEB_KLINE_ACTIVE_CACHE_TTL", "20"))
 KLINE_CACHE_LOCK = threading.Lock()
 KLINE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+INTRADAY_ENTRY_CACHE_TTL = max(10, min(int(os.environ.get("QUANT_WEB_INTRADAY_ENTRY_CACHE_TTL", "30")), 120))
+INTRADAY_ENTRY_LOCK = threading.Lock()
+INTRADAY_ENTRY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 OPENING_LOCK = threading.Lock()
 OPENING_REFRESH_LOCK = threading.Lock()
 OPENING_CACHE: Dict[str, Any] = {"at": 0.0, "source": "", "payload": {}}
@@ -639,6 +642,170 @@ def opening_session() -> Dict[str, Any]:
     if "13:00" <= clock < "15:00":
         return {"active": False, "mode": "afternoon", "label": "下午交易中", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "开盘策略已过时效，等待下一交易日"}
     return {"active": False, "mode": "after", "label": "已收盘", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "等待下一交易日09:35后的核验"}
+
+
+def intraday_entry_session() -> Dict[str, Any]:
+    """盘中即时建仓评估窗口；早盘与午后都允许，但尾盘不把追价包装成机会。"""
+    n = now_cn()
+    clock = n.strftime("%H:%M")
+    if n.weekday() >= 5:
+        return {"active": False, "mode": "closed", "label": "非交易日", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "下一个交易日盘中再做实时评估"}
+    if clock < "09:35":
+        return {"active": False, "mode": "preopen", "label": "待开盘", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "09:35 后读取实时行情"}
+    if "09:35" <= clock < "11:30":
+        return {"active": True, "mode": "morning", "label": "早盘即时评估", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "结合实时价格、分时均价线和日线计划判断"}
+    if "11:30" <= clock < "13:00":
+        return {"active": False, "mode": "noon", "label": "午间休市", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "13:00 开盘后可继续即时评估"}
+    if "13:00" <= clock < "14:50":
+        return {"active": True, "mode": "afternoon", "label": "午后即时评估", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "结合实时价格、分时均价线和日线计划判断"}
+    if "14:50" <= clock < "15:00":
+        return {"active": False, "mode": "late", "label": "尾盘风控窗口", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "尾盘波动与隔夜风险上升，不新增盘中建仓结论"}
+    return {"active": False, "mode": "after", "label": "已收盘", "time": n.strftime("%Y-%m-%d %H:%M:%S"), "next_action": "等待下一交易日盘中使用实时评估"}
+
+
+def _recent_signal_plan(code: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """优先沿用仍在有效期内的收盘扫描计划；没有则退回独立日线计划。"""
+    signal = latest_signal_file()
+    if signal is None:
+        return None, ""
+    ymd = date_from_signal(signal)
+    try:
+        age = (now_cn().date() - dt.datetime.strptime(ymd, "%Y%m%d").date()).days
+    except ValueError:
+        return None, ""
+    if age < 1 or age > 14:
+        return None, ""
+    try:
+        for raw in read_csv_dict(signal):
+            try:
+                if clean_stock_code(raw.get("code")) != code:
+                    continue
+            except ValueError:
+                continue
+            row = dict(raw)
+            row["code"] = code
+            row["is_custom"] = False
+            row.setdefault("strategy", "收盘扫描候选")
+            row.setdefault("strategy_group", strategy_group_name(str(row.get("strategy") or "")))
+            row.setdefault("action", "仅在计划价格与盘中承接同时满足时小仓分批。")
+            return row, f"收盘扫描信号（{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}）"
+    except (OSError, csv.Error):
+        return None, ""
+    return None, ""
+
+
+def _intraday_average(rows: List[Dict[str, Any]]) -> Optional[float]:
+    for row in reversed(rows):
+        value = nullable_float(row.get("average"), 4)
+        if value is not None and value > 0:
+            return value
+    amount = sum(max(0.0, safe_float(row.get("amount"))) for row in rows)
+    volume = sum(max(0.0, safe_float(row.get("volume"))) for row in rows)
+    return round(amount / (volume * 100), 4) if amount > 0 and volume > 0 else None
+
+
+def intraday_entry_decision(row: Dict[str, Any], quote: Dict[str, Any], bars: List[Dict[str, Any]], plan_source: str) -> Dict[str, Any]:
+    """盘中即时建仓执行层：日线计划 + 当前价格 + 分时承接。不会自动下单。"""
+    code = clean_stock_code(row.get("code"))
+    score = safe_float(row.get("score")); custom = bool(row.get("is_custom")); setup_ok = bool(row.get("setup_ok", True))
+    low, high = parse_price_range(row.get("buy_zone")); stop = nullable_float(row.get("stop_loss"), 3)
+    strategy = str(row.get("strategy") or "自定义保守趋势确认")
+    group = str(row.get("strategy_group") or strategy_group_name(strategy))
+    risk = str(row.get("risk_tags") or "")
+    rps60 = nullable_float(row.get("rps60"), 1)
+    score_limit = 78 if custom else 72
+    risk_pass = not any(tag in risk for tag in ("波动偏大", "高波动", "换手过热", "RSI过热", "高风险"))
+    signal_pass = setup_ok and score >= score_limit and (custom or rps60 is None or rps60 >= 55) and risk_pass
+    result: Dict[str, Any] = {
+        "ok": True, "code": code, "name": str(row.get("name") or quote.get("name") or code), "strategy": strategy, "strategy_group": group,
+        "score": score, "source": plan_source, "buy_zone": str(row.get("buy_zone") or "-"), "zone_low": low, "zone_high": high,
+        "stop_loss": stop, "quote": quote, "status": "行情未就绪", "rank": 9,
+        "reason": "实时行情或当日分时尚未就绪，不能据此给出建仓结论。", "checks": [], "intraday": {},
+        "action": "本功能是盘中规则核验，不是自动下单或收益保证。",
+    }
+    if quote.get("stale"):
+        result["reason"] = f"行情日期 {quote.get('trade_date') or '未知'} 不是今天，可能为休市或数据源延迟。"
+        return result
+    if not quote.get("ok") or not bars:
+        return result
+    today = now_cn().date().isoformat()
+    last_date = str(bars[-1].get("trade_date") or str(bars[-1].get("date") or "")[:10])
+    if last_date != today:
+        result["reason"] = f"分时数据最新日期为 {last_date or '未知'}，不是今天 {today}，拒绝使用旧行情给出建仓结论。"
+        return result
+    price = nullable_float(quote.get("price"), 3)
+    pct = nullable_float(quote.get("pct"), 2)
+    day_open = nullable_float(quote.get("open"), 3) or nullable_float(bars[0].get("open"), 3)
+    day_high = max(safe_float(item.get("high")) for item in bars)
+    day_low = min(safe_float(item.get("low")) for item in bars)
+    average = _intraday_average(bars)
+    drawdown = round((day_high - price) / day_high * 100, 2) if price and day_high > 0 else None
+    in_zone = low is not None and high is not None and price is not None and low * .992 <= price <= high * 1.008
+    protected = stop is not None and price is not None and price > stop
+    above_average = average is not None and price is not None and price >= average * .998
+    above_open = day_open is not None and price is not None and price >= day_open * .995
+    not_fading = drawdown is not None and drawdown <= 2.5
+    too_hot_pct = 14.0 if code.startswith(("30", "68")) else 7.5
+    too_hot = pct is not None and pct >= too_hot_pct
+    deep_weak = pct is not None and pct <= -3.5 and not above_average
+    not_chasing = pct is None or pct < 4.5
+    checks = [
+        {"name": "计划买入区间", "pass": in_zone, "text": f"现价 {price:.2f}；计划区间 {low:.2f}~{high:.2f}" if price is not None and low is not None and high is not None else "未获得有效买入区间"},
+        {"name": "日线信号基础", "pass": signal_pass, "text": f"规则评分 {score:.1f}（阈值≥{score_limit}）" + ("；趋势/风险门槛通过" if signal_pass else "；趋势、强度或风险门槛未通过")},
+        {"name": "止损保护", "pass": protected, "text": f"现价 {price:.2f}；止损 {stop:.3f}" if price is not None and stop is not None else "缺少有效止损"},
+        {"name": "分时均价承接", "pass": above_average, "text": f"现价 {price:.2f}；分时均价 {average:.3f}" if price is not None and average is not None else "分时均价不可用"},
+        {"name": "开盘与高点回撤", "pass": above_open and not_fading, "text": f"开盘 {day_open:.2f}；日内高 {day_high:.2f}；回撤 {drawdown:.2f}%" if day_open is not None and drawdown is not None else "开盘或回撤数据不可用"},
+        {"name": "盘中追高保护", "pass": not_chasing and not too_hot, "text": f"当前涨跌 {pct:+.2f}%（常规追高提醒 < +4.5%）" if pct is not None else "涨跌幅不可用"},
+    ]
+    if custom:
+        checks += [{"name": "自定义趋势门槛", "pass": str(item).startswith("✓"), "text": str(item).lstrip("✓× ")} for item in (row.get("setup_reasons") or [])]
+    result["checks"] = checks
+    result["intraday"] = {"latest_time": str(bars[-1].get("time") or "-"), "average": average, "day_high": day_high, "day_low": day_low, "drawdown_pct": drawdown, "bars": len(bars)}
+    if not protected:
+        result.update(status="不建议参与", rank=3, reason="现价已触及或跌破预设止损，原计划失效；不做补仓或摊低成本。")
+    elif too_hot:
+        result.update(status="不建议追高", rank=2, reason=f"当前涨幅 {pct:+.2f}% 已进入高位风险区，盘中不追价，等待新的回踩或下一个交易日。")
+    elif deep_weak:
+        result.update(status="不建议参与", rank=3, reason="盘中跌幅较大且弱于分时均价线，承接不足，等待新的日线信号。")
+    elif not signal_pass:
+        result.update(status="不建议参与", rank=3, reason="日线趋势、规则评分或风险门槛未通过，即使盘中短线走强也不纳入建仓名单。")
+    elif not in_zone:
+        result.update(status="等待回踩", rank=1, reason="当前价格已偏离计划买入区间；不因盘中上涨临时抬高买入价，等待回踩或下一次扫描。")
+    elif not (above_average and above_open and not_fading):
+        result.update(status="等待确认", rank=1, reason="日线计划仍在，但分时均价线、开盘承接或高点回撤未同时满足，先等待承接修复。")
+    elif not_chasing:
+        result.update(status="可小仓试仓", rank=0, reason="日线计划、计划价格、止损、分时均价承接和回撤控制同时通过；仅适合小仓分批，并严格以止损为界。")
+    else:
+        result.update(status="等待确认", rank=1, reason="价格虽在计划区间，但盘中涨幅已偏高；等待回踩，不把强势上涨当作直接追价理由。")
+    return result
+
+
+def intraday_entry_payload(raw_code: Any) -> Dict[str, Any]:
+    """供开盘页的午后/早盘即时评估使用；独立于次日早盘自动核验。"""
+    code = clean_stock_code(raw_code)
+    session = intraday_entry_session()
+    common = {"session": session, "code": code, "checked_at": now_cn().strftime("%Y-%m-%d %H:%M:%S")}
+    if not session["active"]:
+        return {"ok": True, "status": "暂不评估", "reason": f"当前为{session['label']}，{session['next_action']}。", "checks": [], "intraday": {}, **common}
+    now = time.time()
+    with INTRADAY_ENTRY_LOCK:
+        cached = INTRADAY_ENTRY_CACHE.get(code)
+    if cached and now - cached[0] < INTRADAY_ENTRY_CACHE_TTL:
+        payload = dict(cached[1]); payload["cached"] = True; payload["cache_age_seconds"] = int(now - cached[0]); return payload
+    plan, plan_source = _recent_signal_plan(code)
+    if plan is None:
+        plan = custom_watch_plan(code)
+        plan_source = "独立日线趋势计划"
+    quote = fetch_live_quote(code)
+    bars, _, source, _ = _chart_intraday_bars(code)
+    payload = intraday_entry_decision(plan, quote, bars, plan_source)
+    payload.update(common, chart_source=source, cached=False, cache_age_seconds=0)
+    with INTRADAY_ENTRY_LOCK:
+        INTRADAY_ENTRY_CACHE[code] = (now, dict(payload))
+        if len(INTRADAY_ENTRY_CACHE) > 100:
+            for stale_code, _ in sorted(INTRADAY_ENTRY_CACHE.items(), key=lambda item: item[1][0])[:25]:
+                INTRADAY_ENTRY_CACHE.pop(stale_code, None)
+    return payload
 
 
 def parse_price_range(value: Any) -> Tuple[Optional[float], Optional[float]]:
@@ -1660,7 +1827,7 @@ def opening_page_html(payload: Dict[str, Any]) -> str:
 
     watch_script = (
         "<script>window.__OPEN_SOURCE_DATE__=" + script_json(payload.get("source_date") or "") + ";const openWatch=" + script_json(watch)
-        + ";const openRows=" + script_json(opening_rows) + r""";
+        + ";const openRows=" + script_json(opening_rows) + ";const instantEntryCacheTtl=" + script_json(INTRADAY_ENTRY_CACHE_TTL) + r""";
 try{localStorage.removeItem('quant_token')}catch(e){}
 const openEsc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 function getAdminToken(){try{return sessionStorage.getItem('quant_token')||''}catch(e){return ''}}
@@ -1670,6 +1837,10 @@ function openOpeningKline(code){const clean=String(code||'').replace(/\D/g,'').s
 function openWatchHeaders(){const h={'Content-Type':'application/json'};const token=getAdminToken();if(token)h['X-Quant-Token']=token;return h}
 async function openWatchSave(mode,codes){let r=await fetch('/api/watchlist',{method:'POST',headers:openWatchHeaders(),body:JSON.stringify({mode:mode,codes:codes})});if(r.status===401){const t=prompt('请输入管理令牌');if(!t)return;setAdminToken(t);return openWatchSave(mode,codes)}const d=await r.json();if(!r.ok||!d.ok){alert(d.message||'更新失败');return}location.reload()}
 function addWatch(){const value=document.getElementById('watchCode').value;const codes=value.split(/[,，\s]+/).filter(Boolean);if(!codes.length){alert('请输入沪深A股六位代码');return}openWatchSave('add',codes)}
+function entryValue(v,digits=2){const n=Number(v);return Number.isFinite(n)?n.toFixed(digits):'-'}
+function entryStatusClass(status){return /可小仓/.test(status)?'ok':(/不建议/.test(status)?'no':'wait')}
+function renderInstantEntry(d){const box=document.getElementById('instantEntryResult');if(!box)return;if(!d||!d.ok){box.innerHTML=`<p class="no">${openEsc((d&&d.message)||'即时评估失败，请稍后重试')}</p>`;return}const q=d.quote||{},it=d.intraday||{},checks=(d.checks||[]).map(x=>`<li class="${x.pass?'pass':'fail'}"><b>${x.pass?'✓':'×'}</b> ${openEsc(x.name)}：${openEsc(x.text)}</li>`).join('')||'<li class="muted">暂未生成条件项</li>';const status=openEsc(d.status||'暂不评估');const action=d.status==='可小仓试仓'?'可按计划小仓分批，严格执行止损。':'不要因即时行情勉强入场，等待条件同步满足。';box.innerHTML=`<div class="opening-status ${entryStatusClass(d.status)}"><b>${status}</b><br><span class="muted">${openEsc(d.checked_at||'')}</span></div><div style="margin-top:8px"><b>${openEsc(d.code||'')} ${openEsc(d.name||'')}</b>｜${openEsc(d.strategy_group||'-')}｜${openEsc(d.source||'-')}</div><p style="margin:7px 0">${openEsc(d.reason||'-')}</p><div class="small muted">现价 ${entryValue(q.price)}｜涨跌 ${q.pct==null?'-':(Number(q.pct)>=0?'+':'')+entryValue(q.pct)+'%'}｜计划区间 ${openEsc(d.buy_zone||'-')}｜止损 ${entryValue(d.stop_loss,3)}｜分时均价 ${entryValue(it.average,3)}｜日内回撤 ${it.drawdown_pct==null?'-':entryValue(it.drawdown_pct)+'%'}｜分时最新 ${openEsc(it.latest_time||'-')}</div><ul class="detail-checks" style="margin-top:9px">${checks}</ul><div style="margin-top:8px"><button class="btn" type="button" onclick="openOpeningKline('${openEsc(d.code||'')}')">查看分时 / K线</button><span class="small muted" style="margin-left:8px">${openEsc(action)}</span></div>`}
+async function instantEntryCheck(){const input=document.getElementById('instantEntryCode'),box=document.getElementById('instantEntryResult'),code=String(input&&input.value||'').replace(/\D/g,'').slice(0,6);if(!/^(?:00|30|60|68)\d{4}$/.test(code)){alert('请输入沪深A股六位代码');return}if(box)box.innerHTML='<p class="muted">正在读取实时行情、分时与日线计划…</p>';try{const r=await fetch('/api/entry-check?code='+encodeURIComponent(code),{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.message||'即时评估失败');renderInstantEntry(d)}catch(e){if(box)box.innerHTML=`<p class="no">${openEsc(e.message||'网络或行情数据异常，请稍后重试')}</p>`}}
 function removeWatch(code){openWatchSave('remove',[code])}
 function clearWatch(){if(confirm('清空后将隐藏当前自动候选，下一交易日会按开关重新同步，是否继续？'))openWatchSave('replace',[])}
 function journalFromOpening(code){const r=openRows.find(x=>x.code===code);if(!r)return;const plan=(buildPortfolioPlans().plans||{})[code]||calculatePlan(r);const p=new URLSearchParams({code:r.code,name:r.name||'',signal_date:String(window.__OPEN_SOURCE_DATE__||''),entry_price:String(r.price||r.zone_low||''),shares:String(plan.shares||''),stop_loss:String(r.stop_loss||'')});location.href='/positions?'+p.toString()}
@@ -1683,7 +1854,7 @@ function buildPortfolioPlans(){const s=riskSettings();let remainingAmount=s.capi
 function renderPositionPlans(){const portfolio=buildPortfolioPlans();for(const row of openRows){const el=document.getElementById('position-'+row.code);if(!el)continue;const p=portfolio.plans[row.code]||calculatePlan(row);const prefix=row.status==='可计划内执行'?'':'仅作预案 · ';el.innerHTML=p.shares?`<b>${prefix}${p.shares} 股</b><br><span class="small muted">约 ¥${p.amount.toFixed(0)}｜止损风险约 ¥${p.loss.toFixed(0)}</span>`:`<span class="small muted">${prefix}${openEsc(p.note)}</span>`}const summary=document.getElementById('portfolioSummary');if(summary){const s=portfolio.settings;const warning=portfolio.allocated<portfolio.eligible?'；部分候选因组合上限未分配仓位':'';summary.innerHTML=`组合预案：<b>${portfolio.allocated}/${portfolio.eligible}</b> 只可执行候选获得仓位｜预计占用 <b>¥${portfolio.totalAmount.toFixed(0)}</b> / ¥${(s.capital*s.portfolioPct/100).toFixed(0)}｜止损风险 <b>¥${portfolio.totalLoss.toFixed(0)}</b> / ¥${(s.capital*s.portfolioRiskPct/100).toFixed(0)}${warning}`}}
 function csvSafe(v){let s=String(v??'').replace(/\r?\n/g,' ');if(/^[=+\-@]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'}
 function exportOpeningCsv(){if(!openRows.length){alert('当前没有可导出的盘中核验结果');return}const head=['代码','名称','状态','规则评分','战法分类','战法','现价','买入区间','止损','组合仓位股数','预计占用资金','预计止损风险','执行理由'];const portfolio=buildPortfolioPlans();const data=openRows.map(r=>{const p=portfolio.plans[r.code]||calculatePlan(r);return [r.code,r.name,r.status,r.score,r.strategy_group,r.strategy,r.price??'',r.buy_zone,r.stop_loss??'',p.shares,p.amount.toFixed(2),p.loss.toFixed(2),r.reason]});const csv='\ufeff'+[head,...data].map(x=>x.map(csvSafe).join(',')).join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='opening_check_'+new Date().toISOString().slice(0,10)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
-(function(){const hero=document.querySelector('.opening-hero');if(!hero)return;const chips=(openWatch.items||[]).map(x=>`<span class="watch-chip"><button type="button" class="opening-code-link chip-code-link" data-opening-code="${openEsc(x.code)}" title="在新标签页打开K线图">${openEsc(x.code)}</button> ${openEsc(x.name)}<small>${openEsc(x.source)}</small><button class="watch-remove" title="移除监控" aria-label="移除 ${openEsc(x.code)}" onclick="removeWatch('${openEsc(x.code)}')">×</button></span>`).join('')||'<span class="muted">尚未选择；此时默认核验昨日高分候选。</span>';hero.insertAdjacentHTML('afterend',`<section class="card opening-watch" style="margin-bottom:16px"><div class="category-head"><div><h2>我的早盘建仓监控</h2><p>首页可勾选昨日推荐加入监控；也可在这里添加任意沪深 A 股六位代码。自选清单不为空时，本页仅核验清单内股票。</p></div><span class="pill">${openWatch.count||0}/${openWatch.max||100} 只</span></div><div class="watch-chips">${chips}</div><div class="watch-add"><input id="watchCode" class="fundamental-input" maxlength="80" placeholder="输入代码，如 000938；多个代码用逗号分隔"><button class="btn primary" onclick="addWatch()">加入监控</button><button class="btn" onclick="clearWatch()">清空手动监控</button><button class="btn" onclick="clearAdminToken()">清除本页令牌</button><label class="monitor-auto"><input id="openAutoSync" type="checkbox" ${(openWatch.auto_sync||{}).enabled?'checked':''} onchange="setOpenAutoSync(this.checked)"> 自动同步收盘高分股</label></div><div class="small muted" style="margin-top:8px">开启后：每次收盘扫描成功，会自动同步前 ${(openWatch.auto_sync||{}).top_n||12} 只高分候选（纯涨停情绪类除外）；手动监控股票不会被覆盖。管理令牌仅保存在当前标签页；公网管理操作请优先使用 HTTPS。</div></section>`);document.querySelectorAll('[data-opening-code]').forEach(btn=>btn.addEventListener('click',()=>openOpeningKline(btn.dataset.openingCode)));document.getElementById('watchCode').addEventListener('keydown',e=>{if(e.key==='Enter')addWatch()});loadRiskSettings();renderPositionPlans()})();
+(function(){const hero=document.querySelector('.opening-hero');if(!hero)return;const chips=(openWatch.items||[]).map(x=>`<span class="watch-chip"><button type="button" class="opening-code-link chip-code-link" data-opening-code="${openEsc(x.code)}" title="在新标签页打开K线图">${openEsc(x.code)}</button> ${openEsc(x.name)}<small>${openEsc(x.source)}</small><button class="watch-remove" title="移除监控" aria-label="移除 ${openEsc(x.code)}" onclick="removeWatch('${openEsc(x.code)}')">×</button></span>`).join('')||'<span class="muted">尚未选择；此时默认核验昨日高分候选。</span>';hero.insertAdjacentHTML('afterend',`<section class="card opening-watch" style="margin-bottom:16px"><div class="category-head"><div><h2>我的早盘建仓监控</h2><p>首页可勾选昨日推荐加入监控；也可在这里添加任意沪深 A 股六位代码。自选清单不为空时，本页仅核验清单内股票。</p></div><span class="pill">${openWatch.count||0}/${openWatch.max||100} 只</span></div><div class="watch-chips">${chips}</div><div class="watch-add"><input id="watchCode" class="fundamental-input" maxlength="80" placeholder="输入代码，如 000938；多个代码用逗号分隔"><button class="btn primary" onclick="addWatch()">加入监控</button><button class="btn" onclick="clearWatch()">清空手动监控</button><button class="btn" onclick="clearAdminToken()">清除本页令牌</button><label class="monitor-auto"><input id="openAutoSync" type="checkbox" ${(openWatch.auto_sync||{}).enabled?'checked':''} onchange="setOpenAutoSync(this.checked)"> 自动同步收盘高分股</label></div><div class="small muted" style="margin-top:8px">开启后：每次收盘扫描成功，会自动同步前 ${(openWatch.auto_sync||{}).top_n||12} 只高分候选（纯涨停情绪类除外）；手动监控股票不会被覆盖。管理令牌仅保存在当前标签页；公网管理操作请优先使用 HTTPS。</div></section>`);const watchCard=document.querySelector('.opening-watch');if(watchCard)watchCard.insertAdjacentHTML('afterend',`<section class="card" style="margin-bottom:16px"><div class="category-head"><div><h2>盘中即时建仓评估</h2><p>适用于交易日 09:35–11:30、13:00–14:50：输入任意沪深 A 股代码，按日线计划、当前价格、分时均价线、开盘承接与止损给出当前是否适合建仓的规则结论。</p></div><span class="pill">实时辅助</span></div><div class="watch-add"><input id="instantEntryCode" class="fundamental-input" inputmode="numeric" maxlength="6" placeholder="输入代码，如 000938"><button class="btn primary" type="button" onclick="instantEntryCheck()">立即评估当前是否可建仓</button></div><div id="instantEntryResult" class="small muted" style="margin-top:10px">非交易时间不会使用旧行情模拟结论；交易时间内每次评估读取实时行情，短时缓存约 ${openEsc(String(instantEntryCacheTtl||30))} 秒以防止重复请求。</div></section>`);document.querySelectorAll('[data-opening-code]').forEach(btn=>btn.addEventListener('click',()=>openOpeningKline(btn.dataset.openingCode)));document.getElementById('watchCode').addEventListener('keydown',e=>{if(e.key==='Enter')addWatch()});const instantInput=document.getElementById('instantEntryCode');if(instantInput)instantInput.addEventListener('keydown',e=>{if(e.key==='Enter')instantEntryCheck()});loadRiskSettings();renderPositionPlans()})();
 </script>"""
     )
 
@@ -1908,6 +2079,19 @@ class Handler(BaseHTTPRequestHandler):
             allowed,retry=consume_rate(f"opening-history:{self.client_key()}",60,60)
             if not allowed: return self.json({"ok":False,"message":"核验轨迹查询过于频繁"},429,{"Retry-After":str(retry)})
             return self.json({"ok": True, "items": opening_history_payload()})
+        if path=="/api/entry-check":
+            allowed,retry=consume_rate(f"entry-check:{self.client_key()}",20,60)
+            global_allowed,global_retry=consume_rate("entry-check:global",120,60)
+            if not allowed or not global_allowed:
+                return self.json({"ok":False,"message":"即时建仓评估请求过于频繁，请稍后再试"},429,{"Retry-After":str(max(retry,global_retry,1))})
+            try:
+                code = (parse_qs(u.query).get("code") or [""])[0]
+                return self.json(intraday_entry_payload(code))
+            except ValueError as exc:
+                return self.json({"ok":False,"message":str(exc)},400)
+            except Exception:
+                traceback.print_exc()
+                return self.json({"ok":False,"message":"实时行情或分时数据暂不可用，请稍后重试"},503)
         if path=="/api/watchlist":
             allowed,retry=consume_rate(f"watchlist-get:{self.client_key()}",120,60)
             if not allowed: return self.json({"ok":False,"message":"监控清单查询过于频繁"},429,{"Retry-After":str(retry)})

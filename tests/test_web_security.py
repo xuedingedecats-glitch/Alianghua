@@ -103,8 +103,43 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("onclick=\"openOpeningKline(&quot;000001&quot;)\"", page)
         self.assertIn("data-opening-code", page)
         self.assertIn("在新标签页打开K线图", page)
+        self.assertIn("盘中即时建仓评估", page)
+        self.assertIn("/api/entry-check?code=", page)
         self.assertNotIn("胜率优先", page)
 
+    def test_intraday_entry_session_allows_afternoon_window(self):
+        with mock.patch.object(app, "now_cn", return_value=dt.datetime(2026, 7, 13, 13, 30)):
+            result = app.intraday_entry_session()
+        self.assertTrue(result["active"])
+        self.assertEqual(result["mode"], "afternoon")
+
+    def test_intraday_entry_payload_uses_current_quote_and_intraday_support(self):
+        current = dt.datetime(2026, 7, 13, 13, 30)
+        app.INTRADAY_ENTRY_CACHE.clear()
+        plan = {
+            "code": "000001", "name": "测试股份", "score": 90, "is_custom": True,
+            "strategy": "MA20/MA60趋势 + 盘中承接", "strategy_group": "自定义保守趋势确认",
+            "buy_zone": "10.00~11.00", "stop_loss": 9.5, "setup_ok": True, "risk_tags": "自定义代码；需通过趋势门槛",
+            "setup_reasons": ["✓ 收盘位于MA20上方", "✓ 中期均线多头"],
+        }
+        quote = {"ok": True, "stale": False, "code": "000001", "name": "测试股份", "price": 10.5, "pct": 1.2, "open": 10.3, "high": 10.6, "low": 10.2, "trade_date": "2026-07-13"}
+        bars = [
+            {"trade_date": "2026-07-13", "time": "13:25", "open": 10.3, "close": 10.42, "high": 10.5, "low": 10.3, "volume": 100, "amount": 104200, "average": 10.40},
+            {"trade_date": "2026-07-13", "time": "13:30", "open": 10.42, "close": 10.5, "high": 10.6, "low": 10.4, "volume": 120, "amount": 126000, "average": 10.41},
+        ]
+        with mock.patch.object(app, "now_cn", return_value=current), mock.patch.object(app, "_recent_signal_plan", return_value=(None, "")), mock.patch.object(app, "custom_watch_plan", return_value=plan), mock.patch.object(app, "fetch_live_quote", return_value=quote), mock.patch.object(app, "_chart_intraday_bars", return_value=(bars, "测试股份", "测试源", 10.38)):
+            result = app.intraday_entry_payload("000001")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "可小仓试仓")
+        self.assertEqual(result["intraday"]["latest_time"], "13:30")
+        self.assertIn("分时均价承接", [x["name"] for x in result["checks"]])
+
+    def test_intraday_entry_payload_does_not_reuse_nontrading_quote(self):
+        app.INTRADAY_ENTRY_CACHE.clear()
+        with mock.patch.object(app, "now_cn", return_value=dt.datetime(2026, 7, 13, 15, 10)), mock.patch.object(app, "fetch_live_quote") as fetch:
+            result = app.intraday_entry_payload("000001")
+        self.assertEqual(result["status"], "暂不评估")
+        fetch.assert_not_called()
 
     def test_opening_session_only_allows_early_morning_window(self):
         cases = [

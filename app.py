@@ -838,6 +838,114 @@ def _with_moving_averages(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+
+def _eastmoney_intraday_bars(code: str) -> Tuple[List[Dict[str, Any]], str, str, Optional[float]]:
+    """读取当天 1 分钟分时；返回的数据只用于展示，不参与自动下单。"""
+    _, secid, _ = code_market(code)
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "ndays": "1", "iscr": "0", "iscca": "0", "secid": secid,
+    }
+    r = requests.get(
+        "https://push2.eastmoney.com/api/qt/stock/trends2/get", params=params,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}, timeout=10,
+    )
+    r.raise_for_status(); data = r.json().get("data") or {}
+    previous_close = nullable_float(data.get("prePrice") or data.get("preClose"), 3)
+    out: List[Dict[str, Any]] = []
+    for raw in data.get("trends") or []:
+        fields = str(raw).split(",")
+        try:
+            stamp = str(fields[0]); day, clock = stamp.split(" ", 1)
+            out.append({"date": stamp, "time": clock[:5], "open": float(fields[1]), "close": float(fields[2]),
+                        "high": float(fields[3]), "low": float(fields[4]), "volume": float(fields[5]),
+                        "amount": float(fields[6]), "average": nullable_float(fields[7], 3), "trade_date": day})
+        except (ValueError, IndexError):
+            continue
+    if not out:
+        raise RuntimeError("东方财富未返回当天分时数据")
+    return out, str(data.get("name") or code), "东方财富", previous_close
+
+
+
+def _tencent_intraday_bars(code: str) -> Tuple[List[Dict[str, Any]], str, str, Optional[float]]:
+    """腾讯当日分时备用源；接口给出累计量额，函数转换为分钟量额。"""
+    market, _, _ = code_market(code); symbol = market.lower() + code
+    r = requests.get(
+        "https://web.ifzq.gtimg.cn/appstock/app/minute/query", params={"code": symbol},
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}, timeout=10,
+    )
+    r.raise_for_status(); node = ((r.json().get("data") or {}).get(symbol) or {})
+    data = node.get("data") if isinstance(node.get("data"), dict) else {}
+    ymd = str(data.get("date") or "")
+    if len(ymd) != 8 or not ymd.isdigit():
+        raise RuntimeError("腾讯分时日期无效")
+    trade_date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+    quote = (node.get("qt") or {}).get(symbol) or []
+    previous_close = nullable_float(quote[4] if len(quote) > 4 else None, 3)
+    name = str(quote[1] if len(quote) > 1 else code)
+    out: List[Dict[str, Any]] = []; last_price: Optional[float] = None; last_cum_volume = 0.0; last_cum_amount = 0.0
+    running_high: Optional[float] = None; running_low: Optional[float] = None
+    for raw in data.get("data") or []:
+        fields = str(raw).split()
+        try:
+            compact = str(fields[0]); clock = f"{compact[:2]}:{compact[2:4]}"; close = float(fields[1])
+            cumulative_volume = float(fields[2]); cumulative_amount = float(fields[3])
+        except (ValueError, IndexError):
+            continue
+        volume = max(0.0, cumulative_volume - last_cum_volume); amount = max(0.0, cumulative_amount - last_cum_amount)
+        running_high = close if running_high is None else max(running_high, close); running_low = close if running_low is None else min(running_low, close)
+        out.append({"date": f"{trade_date} {clock}", "time": clock, "open": last_price if last_price is not None else close,
+                    "close": close, "high": running_high, "low": running_low, "volume": volume, "amount": amount,
+                    "average": round(cumulative_amount / (cumulative_volume * 100), 3) if cumulative_volume > 0 else None,
+                    "trade_date": trade_date})
+        last_price = close; last_cum_volume = cumulative_volume; last_cum_amount = cumulative_amount
+    if not out:
+        raise RuntimeError("腾讯未返回当天分时数据")
+    return out, name, "腾讯行情", previous_close
+
+def _eastmoney_intraday_kline_fallback(code: str) -> Tuple[List[Dict[str, Any]], str, str, Optional[float]]:
+    """分时主接口异常时的 1 分钟K线备用源。"""
+    _, secid, _ = code_market(code)
+    today = now_cn().date()
+    params = {
+        "secid": secid, "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "1", "fqt": "1", "beg": (today - dt.timedelta(days=4)).strftime("%Y%m%d"),
+        "end": (today + dt.timedelta(days=1)).strftime("%Y%m%d"), "lmt": "1200",
+    }
+    r = requests.get(
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get", params=params,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}, timeout=10,
+    )
+    r.raise_for_status(); data = r.json().get("data") or {}; parsed: List[Dict[str, Any]] = []
+    for raw in data.get("klines") or []:
+        fields = str(raw).split(",")
+        try:
+            stamp = str(fields[0]); day, clock = stamp.split(" ", 1)
+            parsed.append({"date": stamp, "time": clock[:5], "open": float(fields[1]), "close": float(fields[2]),
+                           "high": float(fields[3]), "low": float(fields[4]), "volume": float(fields[5]),
+                           "amount": float(fields[6]), "average": None, "trade_date": day})
+        except (ValueError, IndexError):
+            continue
+    if not parsed:
+        raise RuntimeError("东方财富 1 分钟备用数据不可用")
+    latest_date = parsed[-1]["trade_date"]
+    out = [row for row in parsed if row["trade_date"] == latest_date]
+    if not out:
+        raise RuntimeError("东方财富未返回可展示的分时数据")
+    return out, str(data.get("name") or code), "东方财富（1分钟备用）", nullable_float(data.get("preKPrice"), 3)
+
+
+def _chart_intraday_bars(code: str) -> Tuple[List[Dict[str, Any]], str, str, Optional[float]]:
+    errors: List[str] = []
+    for fetcher in (_eastmoney_intraday_bars, _tencent_intraday_bars, _eastmoney_intraday_kline_fallback):
+        try:
+            return fetcher(code)
+        except Exception as exc:
+            errors.append(f"{fetcher.__name__}:{type(exc).__name__}")
+    raise RuntimeError("当日分时数据暂不可用：" + ", ".join(errors))
+
 def kline_refresh_policy(current: Optional[dt.datetime] = None) -> Dict[str, Any]:
     """K线刷新策略：交易时段短缓存，其他时间降低无意义的外部请求。"""
     current = current or now_cn(); clock = current.strftime("%H:%M:%S")
@@ -852,42 +960,64 @@ def kline_refresh_policy(current: Optional[dt.datetime] = None) -> Dict[str, Any
 
 def kline_payload(raw_code: Any, raw_period: Any = "day", raw_limit: Any = 120, force_refresh: bool = False) -> Dict[str, Any]:
     code = clean_stock_code(raw_code); period = str(raw_period or "day").lower()
-    aliases = {"d":"day", "daily":"day", "w":"week", "weekly":"week", "m":"month", "monthly":"month"}; period = aliases.get(period, period)
-    if period not in {"day", "week", "month"}: raise ValueError("K线周期只支持 day、week、month")
+    aliases = {"d":"day", "daily":"day", "w":"week", "weekly":"week", "m":"month", "monthly":"month",
+               "min":"minute", "1m":"minute", "intraday":"minute", "trend":"minute"}
+    period = aliases.get(period, period)
+    if period not in {"minute", "day", "week", "month"}:
+        raise ValueError("K线周期只支持 minute、day、week、month")
     try: limit = int(raw_limit)
     except (TypeError, ValueError): raise ValueError("K线数量参数无效")
-    limit = max(40, min(limit, 640)); key=f"{code}:{period}:{limit}"; now=time.time(); current=now_cn(); policy=kline_refresh_policy(current)
+    if period == "minute":
+        # A股全天最多约 242 个一分钟节点；分时页始终取全日，前端可缩放、拖动查看。
+        limit = 242
+    else:
+        limit = max(40, min(limit, 640))
+    key=f"{code}:{period}:{limit}"; now=time.time(); current=now_cn(); policy=kline_refresh_policy(current)
     with KLINE_CACHE_LOCK:
         cached=KLINE_CACHE.get(key)
         if not force_refresh and cached and now-cached[0] < policy["cache_ttl_seconds"]:
             result=dict(cached[1]); result.update(policy); result["cached"]=True; result["cache_age_seconds"]=max(0,int(now-cached[0])); result["served_at"]=current.strftime("%Y-%m-%d %H:%M:%S")
             return result
-    source_limits = {"day": limit + 60, "week": (limit + 60) * 6, "month": (limit + 60) * 24}
-    daily, name, source = _chart_daily_bars(code, source_limits[period])
-    if source == "腾讯行情" and period in {"week", "month"}:
-        period_rows, name, source = _tencent_period_bars(code, period, limit + 60)
-        aggregation_note = "周线和月线使用数据源提供的前复权长周期K线。"
+    if period == "minute":
+        rows, name, source, previous_close = _chart_intraday_bars(code)
+        rows = rows[-limit:]
+        if not rows: raise RuntimeError("未获得可展示的当日分时数据")
+        latest_bar_date = str(rows[-1].get("trade_date") or rows[-1].get("date", "-")[:10])
+        latest_bar_time = str(rows[-1].get("time") or "-")
+        fetched_at=current.strftime("%Y-%m-%d %H:%M:%S")
+        is_today = latest_bar_date == current.date().isoformat()
+        note = "分时图为当日 1 分钟行情；白线为成交均价，虚线为昨收。"
+        if not is_today:
+            note += f" 当前数据日期为 {latest_bar_date}，并非自然日 {current.date().isoformat()}，可能处于休市或数据源尚未更新。"
+        payload={"ok":True,"code":code,"name":name,"period":period,"chart_type":"intraday","source":source,"adjust":"不复权（当日分时）",
+                 "updated_at":fetched_at,"fetched_at":fetched_at,"served_at":fetched_at,"latest_bar_date":latest_bar_date,
+                 "latest_bar_time":latest_bar_time,"previous_close":previous_close,"cached":False,"cache_age_seconds":0,**policy,
+                 "rows":rows,"ma_periods":[],"note":note}
     else:
-        period_rows = _aggregate_kline(daily, period)
-        aggregation_note = "周线和月线由前复权日线聚合。"
-    # 多取60根用于均线预热，最终只返回页面需要的数量。
-    calculated = _with_moving_averages(period_rows)
-    rows = calculated[-limit:]
-    if not rows: raise RuntimeError("未获得可展示的K线数据")
-    fetched_at=current.strftime("%Y-%m-%d %H:%M:%S"); latest_bar_date=str(rows[-1].get("date") or "-")
-    note = "日线盘中最后一根可能随当日行情变化；" + aggregation_note
-    if latest_bar_date != current.date().isoformat():
-        note += f" 当前最新K线截止 {latest_bar_date}，不是自然日 {current.date().isoformat()} 的行情。"
-    payload={"ok":True,"code":code,"name":name,"period":period,"source":source,"adjust":"前复权","updated_at":fetched_at,"fetched_at":fetched_at,"served_at":fetched_at,
-             "latest_bar_date":latest_bar_date,"cached":False,"cache_age_seconds":0,**policy,"rows":rows,
-             "ma_periods":[5,10,20,60],"note":note}
+        source_limits = {"day": limit + 60, "week": (limit + 60) * 6, "month": (limit + 60) * 24}
+        daily, name, source = _chart_daily_bars(code, source_limits[period])
+        if source == "腾讯行情" and period in {"week", "month"}:
+            period_rows, name, source = _tencent_period_bars(code, period, limit + 60)
+            aggregation_note = "周线和月线使用数据源提供的前复权长周期K线。"
+        else:
+            period_rows = _aggregate_kline(daily, period)
+            aggregation_note = "周线和月线由前复权日线聚合。"
+        calculated = _with_moving_averages(period_rows)
+        rows = calculated[-limit:]
+        if not rows: raise RuntimeError("未获得可展示的K线数据")
+        fetched_at=current.strftime("%Y-%m-%d %H:%M:%S"); latest_bar_date=str(rows[-1].get("date") or "-")
+        note = "日线盘中最后一根可能随当日行情变化；" + aggregation_note
+        if latest_bar_date != current.date().isoformat():
+            note += f" 当前最新K线截止 {latest_bar_date}，不是自然日 {current.date().isoformat()} 的行情。"
+        payload={"ok":True,"code":code,"name":name,"period":period,"chart_type":"kline","source":source,"adjust":"前复权","updated_at":fetched_at,"fetched_at":fetched_at,"served_at":fetched_at,
+                 "latest_bar_date":latest_bar_date,"cached":False,"cache_age_seconds":0,**policy,"rows":rows,
+                 "ma_periods":[5,10,20,60],"note":note}
     with KLINE_CACHE_LOCK:
         KLINE_CACHE[key]=(now,dict(payload))
         if len(KLINE_CACHE)>200:
             oldest=sorted(KLINE_CACHE.items(),key=lambda x:x[1][0])[:50]
             for old_key,_ in oldest: KLINE_CACHE.pop(old_key,None)
     return payload
-
 
 def custom_watch_plan(code: str) -> Dict[str, Any]:
     code=clean_stock_code(code)
@@ -1460,7 +1590,7 @@ async function mutate(body){try{journal=await api('POST',body);renderJournal()}c
 
 def page_html(payload: Dict[str,Any]) -> str:
     data=script_json(payload)
-    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>A股量化推荐驾驶舱</title><style>{STYLE}</style></head><body><div class="bg-orb one"></div><div class="bg-orb two"></div><main class="wrap" id="app"></main><div class="modal" id="modal"><div class="modal-card"><button class="x" onclick="hideReport()">×</button><h2>Markdown报告</h2><pre id="reportText"></pre></div></div><div class="modal kline-modal" id="klineModal"><div class="modal-card kline-card"><button class="x kline-close" onclick="closeKline()">×</button><div class="kline-head"><div><span class="eyebrow">前复权行情 · 仅供技术复盘</span><h2 id="klineTitle">K线图</h2><div id="klineMeta" class="small muted"></div></div><div class="kline-actions"><button class="filter-btn active" data-period="day" onclick="setKlinePeriod('day')">日线</button><button class="filter-btn" data-period="week" onclick="setKlinePeriod('week')">周线</button><button class="filter-btn" data-period="month" onclick="setKlinePeriod('month')">月线</button><button class="filter-btn" id="klineFullscreenBtn" onclick="toggleKlineFullscreen()">全屏</button><button class="filter-btn" id="klineRefreshBtn" onclick="refreshKlineNow()">刷新行情</button><label class="kline-auto"><input id="klineAuto" type="checkbox" checked onchange="setKlineAutoRefresh(this.checked)">自动刷新</label><button class="filter-btn" onclick="klineToFundamental()">查看基本面</button></div></div><div class="kline-tools"><div id="klineMa" class="kline-ma"></div><div class="kline-range"><span class="small muted">历史范围</span><button class="filter-btn" data-limit="120" onclick="setKlineLimit(120)">120根</button><button class="filter-btn active" data-limit="240" onclick="setKlineLimit(240)">240根</button><button class="filter-btn" data-limit="480" onclick="setKlineLimit(480)">480根</button><button class="filter-btn" data-limit="640" onclick="setKlineLimit(640)">640根</button><span class="kline-divider"></span><button class="filter-btn" onclick="panKline(-1)">← 较早</button><button class="filter-btn" onclick="zoomKline(.7)">＋ 放大</button><button class="filter-btn" onclick="zoomKline(1.4)">－ 缩小</button><button class="filter-btn" onclick="panKline(1)">较新 →</button><button class="filter-btn" onclick="resetKlineView()">回到最新</button></div></div><div class="kline-status"><div id="klineInfo" class="kline-info">点击代码后加载K线数据</div><div class="kline-status-right"><div id="klineViewport" class="small muted"></div><div id="klineRefreshStatus" class="kline-refresh-status">等待刷新计划</div></div></div><div class="kline-canvas-wrap"><canvas id="klineCanvas" aria-label="股票K线图"></canvas><div id="klineLoading" class="kline-loading">正在加载K线…</div></div><div class="small muted kline-note" id="klineNote">红色为上涨，绿色为下跌；均线随所选日/周/月周期计算。鼠标滚轮可缩放，按住图表左右拖拽可浏览历史，方向键也可平移。</div></div></div><script>window.__DATA__={data};{SCRIPT}</script></body></html>'''
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>A股量化推荐驾驶舱</title><style>{STYLE}</style></head><body><div class="bg-orb one"></div><div class="bg-orb two"></div><main class="wrap" id="app"></main><div class="modal" id="modal"><div class="modal-card"><button class="x" onclick="hideReport()">×</button><h2>Markdown报告</h2><pre id="reportText"></pre></div></div><div class="modal kline-modal" id="klineModal"><div class="modal-card kline-card"><button class="x kline-close" onclick="closeKline()">×</button><div class="kline-head"><div><span class="eyebrow">前复权行情 · 仅供技术复盘</span><h2 id="klineTitle">K线图</h2><div id="klineMeta" class="small muted"></div></div><div class="kline-actions"><button class="filter-btn" data-period="minute" onclick="setKlinePeriod('minute')">当日分时</button><button class="filter-btn active" data-period="day" onclick="setKlinePeriod('day')">日线</button><button class="filter-btn" data-period="week" onclick="setKlinePeriod('week')">周线</button><button class="filter-btn" data-period="month" onclick="setKlinePeriod('month')">月线</button><button class="filter-btn" id="klineFullscreenBtn" onclick="toggleKlineFullscreen()">全屏</button><button class="filter-btn" id="klineRefreshBtn" onclick="refreshKlineNow()">刷新行情</button><label class="kline-auto"><input id="klineAuto" type="checkbox" checked onchange="setKlineAutoRefresh(this.checked)">自动刷新</label><button class="filter-btn" onclick="klineToFundamental()">查看基本面</button></div></div><div class="kline-tools" id="klineTools"><div id="klineMa" class="kline-ma"></div><div class="kline-range"><span class="small muted">历史范围</span><button class="filter-btn" data-limit="120" onclick="setKlineLimit(120)">120根</button><button class="filter-btn active" data-limit="240" onclick="setKlineLimit(240)">240根</button><button class="filter-btn" data-limit="480" onclick="setKlineLimit(480)">480根</button><button class="filter-btn" data-limit="640" onclick="setKlineLimit(640)">640根</button><span class="kline-divider"></span><button class="filter-btn" onclick="panKline(-1)">← 较早</button><button class="filter-btn" onclick="zoomKline(.7)">＋ 放大</button><button class="filter-btn" onclick="zoomKline(1.4)">－ 缩小</button><button class="filter-btn" onclick="panKline(1)">较新 →</button><button class="filter-btn" onclick="resetKlineView()">回到最新</button></div></div><div class="kline-status"><div id="klineInfo" class="kline-info">点击代码后加载K线数据</div><div class="kline-status-right"><div id="klineViewport" class="small muted"></div><div id="klineRefreshStatus" class="kline-refresh-status">等待刷新计划</div></div></div><div class="kline-canvas-wrap"><canvas id="klineCanvas" aria-label="股票K线图"></canvas><div id="klineLoading" class="kline-loading">正在加载K线…</div></div><div class="small muted kline-note" id="klineNote">当日分时为 1 分钟行情，日/周/月K线为前复权数据；鼠标滚轮可缩放，按住图表左右拖拽可浏览，方向键也可平移。</div></div></div><script>window.__DATA__={data};{SCRIPT}</script></body></html>'''
 
 
 def opening_detail_page_html(payload: Dict[str, Any]) -> str:
@@ -1619,27 +1749,32 @@ async function queryFundamental(raw){const input=document.getElementById('fund-c
 
 const KLINE_MA_COLORS={5:'#ffd166',10:'#58dcff',20:'#d08cff',60:'#ff9f68'};
 let klineState={code:'',name:'',period:'day',data:null,mas:new Set([5,10,20,60]),request:0,limit:240,visible:240,offset:0,auto:true,timer:null,ticker:null,nextRefreshAt:0};
-function openKline(code){const clean=String(code||'').replace(/\D/g,'').slice(0,6),row=(window.__DATA__.rows||[]).find(x=>String(x.code)===clean);klineState.code=clean;klineState.name=row?.name||'';klineState.period='day';klineState.data=null;klineState.offset=0;klineState.visible=klineState.limit;document.body.classList.add('kline-open');document.getElementById('klineModal').classList.add('show');document.getElementById('klineAuto').checked=klineState.auto;const refreshBtn=document.getElementById('klineRefreshBtn');refreshBtn.disabled=false;refreshBtn.textContent='刷新行情';document.getElementById('klineRefreshStatus').textContent='正在获取刷新计划…';document.getElementById('klineTitle').textContent=`${klineState.code} ${klineState.name} K线图`;document.querySelectorAll('[data-period]').forEach(b=>b.classList.toggle('active',b.dataset.period==='day'));loadKline()}
+function isMinutePeriod(){return klineState.period==='minute'}
+function syncKlinePeriodUI(){const minute=isMinutePeriod(),tools=document.getElementById('klineTools'),note=document.getElementById('klineNote');if(tools)tools.hidden=minute;if(note)note.textContent=minute?'当日分时为 1 分钟行情，白线为成交均价，虚线为昨收；可滚轮缩放或拖拽查看时段。':'日/周/月K线为前复权数据；可切换均线、历史范围，鼠标滚轮缩放或拖拽查看。'}
+function openKline(code){const clean=String(code||'').replace(/\D/g,'').slice(0,6),row=(window.__DATA__.rows||[]).find(x=>String(x.code)===clean);klineState.code=clean;klineState.name=row?.name||'';klineState.period='day';klineState.data=null;klineState.offset=0;klineState.visible=klineState.limit;document.body.classList.add('kline-open');document.getElementById('klineModal').classList.add('show');document.getElementById('klineAuto').checked=klineState.auto;const refreshBtn=document.getElementById('klineRefreshBtn');refreshBtn.disabled=false;refreshBtn.textContent='刷新行情';document.getElementById('klineRefreshStatus').textContent='正在获取刷新计划…';document.getElementById('klineTitle').textContent=`${klineState.code} ${klineState.name} K线图`;document.querySelectorAll('[data-period]').forEach(b=>b.classList.toggle('active',b.dataset.period==='day'));syncKlinePeriodUI();loadKline()}
 function closeKline(){klineState.request++;clearKlineRefreshTimers();const refreshBtn=document.getElementById('klineRefreshBtn');if(refreshBtn){refreshBtn.disabled=false;refreshBtn.textContent='刷新行情'}document.body.classList.remove('kline-open');const modal=document.getElementById('klineModal');modal.classList.remove('show','fullscreen');document.getElementById('klineFullscreenBtn').textContent='全屏'}
-function setKlinePeriod(period){if(!['day','week','month'].includes(period)||period===klineState.period)return;klineState.period=period;klineState.offset=0;document.querySelectorAll('[data-period]').forEach(b=>b.classList.toggle('active',b.dataset.period===period));loadKline()}
+function setKlinePeriod(period){if(!['minute','day','week','month'].includes(period)||period===klineState.period)return;klineState.period=period;klineState.offset=0;klineState.visible=period==='minute'?(klineState.data?.rows?.length||242):klineState.limit;document.querySelectorAll('[data-period]').forEach(b=>b.classList.toggle('active',b.dataset.period===period));syncKlinePeriodUI();loadKline()}
 function clearKlineRefreshTimers(){clearTimeout(klineState.timer);clearInterval(klineState.ticker);klineState.timer=null;klineState.ticker=null;klineState.nextRefreshAt=0}
 function updateKlineRefreshStatus(){const el=document.getElementById('klineRefreshStatus');if(!el)return;if(!klineState.auto){el.textContent='自动刷新已关闭';return}if(!klineState.nextRefreshAt){el.textContent='等待刷新计划';return}const remain=Math.max(0,Math.ceil((klineState.nextRefreshAt-Date.now())/1000)),m=String(Math.floor(remain/60)).padStart(2,'0'),sec=String(remain%60).padStart(2,'0');el.textContent=`下次自动刷新 ${m}:${sec}`}
 function scheduleKlineRefresh(seconds){clearKlineRefreshTimers();if(!klineState.auto||!document.getElementById('klineModal')?.classList.contains('show')){updateKlineRefreshStatus();return}const wait=Math.max(15,Number(seconds)||300);klineState.nextRefreshAt=Date.now()+wait*1000;updateKlineRefreshStatus();klineState.ticker=setInterval(updateKlineRefreshStatus,1000);klineState.timer=setTimeout(()=>loadKline(true),wait*1000)}
 function setKlineAutoRefresh(on){klineState.auto=!!on;if(on)scheduleKlineRefresh(klineState.data?.auto_refresh_seconds||300);else{clearKlineRefreshTimers();updateKlineRefreshStatus()}}
 function refreshKlineNow(){if(document.getElementById('klineRefreshBtn')?.disabled)return;loadKline(true,true)}
 function toggleKlineFullscreen(){const modal=document.getElementById('klineModal'),on=modal.classList.toggle('fullscreen');document.getElementById('klineFullscreenBtn').textContent=on?'退出全屏':'全屏';setTimeout(drawKline,40)}
-function setKlineLimit(limit){limit=Math.max(40,Math.min(640,Number(limit)||240));if(limit===klineState.limit)return;klineState.limit=limit;klineState.visible=limit;klineState.offset=0;document.querySelectorAll('[data-limit]').forEach(b=>b.classList.toggle('active',Number(b.dataset.limit)===limit));loadKline()}
+function setKlineLimit(limit){if(isMinutePeriod()){resetKlineView();return}limit=Math.max(40,Math.min(640,Number(limit)||240));if(limit===klineState.limit)return;klineState.limit=limit;klineState.visible=limit;klineState.offset=0;document.querySelectorAll('[data-limit]').forEach(b=>b.classList.toggle('active',Number(b.dataset.limit)===limit));loadKline()}
 function zoomKline(factor){if(!klineState.data?.rows?.length)return;const max=klineState.data.rows.length,next=Math.max(20,Math.min(max,Math.round(klineState.visible*factor)));klineState.visible=next;klineState.offset=Math.min(klineState.offset,Math.max(0,max-next));drawKline()}
 function panKline(direction){if(!klineState.data?.rows?.length)return;const maxOffset=Math.max(0,klineState.data.rows.length-klineState.visible),step=Math.max(1,Math.round(klineState.visible*.45));klineState.offset=Math.max(0,Math.min(maxOffset,klineState.offset+(direction<0?step:-step)));drawKline()}
-function resetKlineView(){if(!klineState.data?.rows?.length)return;klineState.offset=0;drawKline()}
+function resetKlineView(){if(!klineState.data?.rows?.length)return;klineState.offset=0;if(isMinutePeriod())klineState.visible=klineState.data.rows.length;drawKline()}
 function klineToFundamental(){const code=klineState.code;closeKline();location.hash='fundamentals';setTimeout(()=>queryFundamental(code),50)}
 function klineMaControls(){const box=document.getElementById('klineMa');box.innerHTML=[5,10,20,60].map(n=>`<label class="ma-toggle" style="--ma-color:${KLINE_MA_COLORS[n]}"><input type="checkbox" ${klineState.mas.has(n)?'checked':''} onchange="toggleKlineMa(${n},this.checked)"><span style="color:${KLINE_MA_COLORS[n]}">MA${n}</span></label>`).join('')}
 function toggleKlineMa(n,on){on?klineState.mas.add(n):klineState.mas.delete(n);drawKline()}
-async function loadKline(silent=false,force=false){const req=++klineState.request,loading=document.getElementById('klineLoading'),canvas=document.getElementById('klineCanvas'),refreshBtn=document.getElementById('klineRefreshBtn'),oldData=klineState.data,oldVisible=klineState.visible,oldOffset=klineState.offset;clearKlineRefreshTimers();if(!force&&refreshBtn){refreshBtn.disabled=false;refreshBtn.textContent='刷新行情'}if(force&&refreshBtn){refreshBtn.disabled=true;refreshBtn.textContent='刷新中…'}if(!silent){loading.textContent='正在加载K线…';loading.classList.remove('hide');document.getElementById('klineInfo').textContent='';klineState.data=null;if(canvas){const c=canvas.getContext('2d');c.clearRect(0,0,canvas.width,canvas.height)}}klineMaControls();try{const forceParam=force?'&refresh=1':'';const r=await fetch(`/api/kline?code=${encodeURIComponent(klineState.code)}&period=${encodeURIComponent(klineState.period)}&limit=${klineState.limit}${forceParam}&_=${Date.now()}`,{cache:'no-store'});const d=await r.json();if(req!==klineState.request)return;if(!r.ok||!d.ok)throw new Error(d.message||'K线查询失败');klineState.data=d;klineState.offset=silent?Math.min(oldOffset,Math.max(0,d.rows.length-oldVisible)):0;klineState.visible=Math.min(silent?oldVisible:klineState.visible||klineState.limit,d.rows.length);klineState.name=d.name||klineState.name;document.getElementById('klineTitle').textContent=`${d.code} ${d.name||''} · ${{day:'日线',week:'周线',month:'月线'}[d.period]}`;const cacheText=d.cached?`缓存 ${d.cache_age_seconds||0}秒`:'刚获取';document.getElementById('klineMeta').textContent=`${d.source}｜${d.adjust}｜行情截止 ${d.latest_bar_date||'-'}｜查询 ${d.served_at||d.fetched_at||'-'}｜${cacheText}｜${d.market_state||''}`;document.getElementById('klineNote').textContent=(d.note||'红涨绿跌；均线随当前周期计算。')+` 自动刷新：${d.market_active?'交易时段约30秒':'非交易时段约5分钟'}。`;loading.classList.add('hide');drawKline();scheduleKlineRefresh(d.auto_refresh_seconds)}catch(e){if(req!==klineState.request)return;if(!silent){loading.textContent=`加载失败：${e.message||'请稍后重试'}`;scheduleKlineRefresh(60)}else{klineState.data=oldData;document.getElementById('klineMeta').textContent+='｜自动刷新失败，稍后重试';scheduleKlineRefresh(60)}}finally{if(force&&req===klineState.request&&refreshBtn){refreshBtn.disabled=false;refreshBtn.textContent='刷新行情'}}}
+async function loadKline(silent=false,force=false){const req=++klineState.request,loading=document.getElementById('klineLoading'),canvas=document.getElementById('klineCanvas'),refreshBtn=document.getElementById('klineRefreshBtn'),oldData=klineState.data,oldVisible=klineState.visible,oldOffset=klineState.offset;clearKlineRefreshTimers();if(!force&&refreshBtn){refreshBtn.disabled=false;refreshBtn.textContent='刷新行情'}if(force&&refreshBtn){refreshBtn.disabled=true;refreshBtn.textContent='刷新中…'}if(!silent){loading.textContent=isMinutePeriod()?'正在加载当日分时…':'正在加载K线…';loading.classList.remove('hide');document.getElementById('klineInfo').textContent='';klineState.data=null;if(canvas){const c=canvas.getContext('2d');c.clearRect(0,0,canvas.width,canvas.height)}}klineMaControls();try{const forceParam=force?'&refresh=1':'';const limit=isMinutePeriod()?242:klineState.limit;const r=await fetch(`/api/kline?code=${encodeURIComponent(klineState.code)}&period=${encodeURIComponent(klineState.period)}&limit=${limit}${forceParam}&_=${Date.now()}`,{cache:'no-store'});const d=await r.json();if(req!==klineState.request)return;if(!r.ok||!d.ok)throw new Error(d.message||'行情查询失败');klineState.data=d;klineState.offset=silent?Math.min(oldOffset,Math.max(0,d.rows.length-oldVisible)):0;const defaultVisible=d.period==='minute'?d.rows.length:(klineState.visible||klineState.limit);klineState.visible=Math.min(silent?oldVisible:defaultVisible,d.rows.length);klineState.name=d.name||klineState.name;const periodName={minute:'当日分时',day:'日线',week:'周线',month:'月线'}[d.period]||'K线';document.getElementById('klineTitle').textContent=`${d.code} ${d.name||''} · ${periodName}`;const cacheText=d.cached?`缓存 ${d.cache_age_seconds||0}秒`:'刚获取';const cutoff=d.latest_bar_time?`${d.latest_bar_date||'-'} ${d.latest_bar_time}`:(d.latest_bar_date||'-');document.getElementById('klineMeta').textContent=`${d.source}｜${d.adjust}｜行情截止 ${cutoff}｜查询 ${d.served_at||d.fetched_at||'-'}｜${cacheText}｜${d.market_state||''}`;document.getElementById('klineNote').textContent=(d.note||'行情数据仅供技术复盘。')+` 自动刷新：${d.market_active?'交易时段约30秒':'非交易时段约5分钟'}。`;syncKlinePeriodUI();loading.classList.add('hide');drawKline();scheduleKlineRefresh(d.auto_refresh_seconds)}catch(e){if(req!==klineState.request)return;if(!silent){loading.textContent=`加载失败：${e.message||'请稍后重试'}`;scheduleKlineRefresh(60)}else{klineState.data=oldData;document.getElementById('klineMeta').textContent+='｜自动刷新失败，稍后重试';scheduleKlineRefresh(60)}}finally{if(force&&req===klineState.request&&refreshBtn){refreshBtn.disabled=false;refreshBtn.textContent='刷新行情'}}}
 function klineVol(v){const n=Number(v||0);return n>=1e8?(n/1e8).toFixed(2)+'亿':n>=1e4?(n/1e4).toFixed(1)+'万':n.toFixed(0)}
 function klineRowInfo(r){if(!r)return '';const pct=(r.close/r.open-1)*100;return `${r.date}　开 ${r.open.toFixed(2)}　高 ${r.high.toFixed(2)}　低 ${r.low.toFixed(2)}　收 ${r.close.toFixed(2)}　${pct>=0?'+':''}${pct.toFixed(2)}%　量 ${klineVol(r.volume)}　`+[5,10,20,60].filter(n=>klineState.mas.has(n)&&r['ma'+n]!=null).map(n=>`MA${n} ${Number(r['ma'+n]).toFixed(2)}`).join('　')}
+function minuteRowInfo(r){if(!r)return '';const pre=Number(klineState.data?.previous_close||r.open||0),pct=pre?((Number(r.close)-pre)/pre*100):0,avg=r.average!=null?`　均价 ${Number(r.average).toFixed(2)}`:'';return `${r.date}　现价 ${Number(r.close).toFixed(2)}　涨跌 ${pct>=0?'+':''}${pct.toFixed(2)}%　高 ${Number(r.high).toFixed(2)}　低 ${Number(r.low).toFixed(2)}　量 ${klineVol(r.volume)}${avg}`}
 function paintKlineBase(canvas,c,rows,w,h){c.clearRect(0,0,w,h);const left=58,right=18,top=24,priceBottom=Math.round(h*.72),volTop=priceBottom+24,bottom=h-32,plotW=w-left-right,priceH=priceBottom-top,volH=bottom-volTop;let vals=[];rows.forEach(r=>{vals.push(r.low,r.high);[5,10,20,60].forEach(n=>{if(klineState.mas.has(n)&&r['ma'+n]!=null)vals.push(r['ma'+n])})});let min=Math.min(...vals),max=Math.max(...vals),pad=Math.max((max-min)*.06,max*.005,.01);min-=pad;max+=pad;const py=v=>top+(max-v)/(max-min)*priceH,maxVol=Math.max(...rows.map(r=>r.volume||0),1),step=plotW/rows.length,body=Math.max(2,Math.min(9,step*.62));c.font='11px sans-serif';c.strokeStyle='#17334c';c.fillStyle='#7895ae';c.lineWidth=1;for(let i=0;i<=5;i++){const y=top+priceH*i/5;c.beginPath();c.moveTo(left,y);c.lineTo(w-right,y);c.stroke();const v=max-(max-min)*i/5;c.fillText(v.toFixed(2),5,y+4)}for(let i=0;i<rows.length;i++){const r=rows[i],x=left+step*(i+.5),up=r.close>=r.open,color=up?'#ef5350':'#26a69a';c.strokeStyle=color;c.fillStyle=color;c.beginPath();c.moveTo(x,py(r.high));c.lineTo(x,py(r.low));c.stroke();const y1=py(r.open),y2=py(r.close),bh=Math.max(1,Math.abs(y2-y1));up?c.strokeRect(x-body/2,Math.min(y1,y2),body,bh):c.fillRect(x-body/2,Math.min(y1,y2),body,bh);const vh=(r.volume/maxVol)*volH;c.globalAlpha=.7;c.fillRect(x-body/2,bottom-vh,body,vh);c.globalAlpha=1}for(const n of [5,10,20,60]){if(!klineState.mas.has(n))continue;c.strokeStyle=KLINE_MA_COLORS[n];c.lineWidth=1.35;c.beginPath();let started=false;rows.forEach((r,i)=>{const v=r['ma'+n];if(v==null)return;const x=left+step*(i+.5),y=py(v);started?c.lineTo(x,y):c.moveTo(x,y);started=true});if(started)c.stroke()}c.fillStyle='#7895ae';c.strokeStyle='#17334c';c.lineWidth=1;for(let i=0;i<6;i++){const idx=Math.min(rows.length-1,Math.round(i*(rows.length-1)/5)),x=left+step*(idx+.5);c.fillText(rows[idx].date.slice(2),Math.max(left,x-25),h-10)}c.fillText('成交量',5,volTop+12);return {left,right,top,bottom,step,py}}
-function drawKline(){const d=klineState.data,canvas=document.getElementById('klineCanvas');if(!d||!canvas||!d.rows?.length)return;const allRows=d.rows,total=allRows.length; klineState.visible=Math.max(20,Math.min(total,klineState.visible||120));klineState.offset=Math.max(0,Math.min(Math.max(0,total-klineState.visible),klineState.offset||0));const end=Math.max(klineState.visible,total-klineState.offset),start=Math.max(0,end-klineState.visible),rows=allRows.slice(start,end),w=Math.max(620,canvas.clientWidth||1000),h=Math.max(320,canvas.clientHeight||560),dpr=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);const latest=rows[rows.length-1];let geom=paintKlineBase(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=klineRowInfo(latest);document.getElementById('klineViewport').textContent=`显示 ${start+1}-${end} / ${total} 根｜${rows[0].date} 至 ${rows[rows.length-1].date}`;canvas.onmousemove=e=>{const rect=canvas.getBoundingClientRect(),mx=(e.clientX-rect.left)*w/rect.width,idx=Math.max(0,Math.min(rows.length-1,Math.floor((mx-geom.left)/geom.step)));geom=paintKlineBase(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=klineRowInfo(rows[idx]);drawKlineCross(c,w,geom,idx,rows)};canvas.onmouseleave=()=>{geom=paintKlineBase(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=klineRowInfo(latest)};canvas.onwheel=e=>{e.preventDefault();zoomKline(e.deltaY<0?.8:1.25)};let dragX=null;canvas.onpointerdown=e=>{dragX=e.clientX;canvas.classList.add('dragging');canvas.setPointerCapture?.(e.pointerId)};canvas.onpointerup=e=>{if(dragX==null)return;const dx=e.clientX-dragX;dragX=null;canvas.classList.remove('dragging');if(Math.abs(dx)>35)panKline(dx>0?-1:1)};canvas.onpointercancel=()=>{dragX=null;canvas.classList.remove('dragging')}}
+function paintMinuteBase(canvas,c,rows,w,h){c.clearRect(0,0,w,h);const left=58,right=46,top=24,priceBottom=Math.round(h*.72),volTop=priceBottom+24,bottom=h-32,plotW=w-left-right,priceH=priceBottom-top,volH=bottom-volTop,pre=Number(klineState.data?.previous_close||rows[0]?.open||0);let vals=[pre];rows.forEach(r=>{vals.push(Number(r.low),Number(r.high));if(r.average!=null)vals.push(Number(r.average))});let min=Math.min(...vals.filter(Number.isFinite)),max=Math.max(...vals.filter(Number.isFinite));const span=Math.max(max-min,pre*.002,.01),pad=Math.max(span*.12,pre*.003,.01);min-=pad;max+=pad;const py=v=>top+(max-v)/(max-min)*priceH,maxVol=Math.max(...rows.map(r=>Number(r.volume)||0),1),step=plotW/Math.max(rows.length-1,1),bar=Math.max(1,Math.min(4,step*.7));c.font='11px sans-serif';c.strokeStyle='#17334c';c.fillStyle='#7895ae';c.lineWidth=1;for(let i=0;i<=5;i++){const y=top+priceH*i/5;c.beginPath();c.moveTo(left,y);c.lineTo(w-right,y);c.stroke();const value=max-(max-min)*i/5,pct=pre?((value/pre-1)*100):0;c.fillText(value.toFixed(2),5,y+4);c.fillText(`${pct>=0?'+':''}${pct.toFixed(1)}%`,w-right+7,y+4)}if(pre){const y=py(pre);c.save();c.setLineDash([4,4]);c.strokeStyle='#7393ad';c.beginPath();c.moveTo(left,y);c.lineTo(w-right,y);c.stroke();c.restore();c.fillStyle='#a8c0d5';c.fillText(`昨收 ${pre.toFixed(2)}`,left+5,Math.max(top+12,y-5))}const colorFor=(r,i)=>Number(r.close)>=(i?Number(rows[i-1].close):pre)?'#ef5350':'#26a69a';c.lineWidth=1.8;for(let i=1;i<rows.length;i++){c.strokeStyle=colorFor(rows[i],i);c.beginPath();c.moveTo(left+step*(i-1),py(Number(rows[i-1].close)));c.lineTo(left+step*i,py(Number(rows[i].close)));c.stroke()}if(rows.length===1){c.fillStyle=colorFor(rows[0],0);c.beginPath();c.arc(left,py(Number(rows[0].close)),2.5,0,Math.PI*2);c.fill()}if(rows.some(r=>r.average!=null)){c.strokeStyle='#f5f7fa';c.lineWidth=1.1;c.beginPath();let started=false;rows.forEach((r,i)=>{if(r.average==null)return;const x=left+step*i,y=py(Number(r.average));started?c.lineTo(x,y):c.moveTo(x,y);started=true});if(started)c.stroke()}for(let i=0;i<rows.length;i++){const r=rows[i],x=left+step*i,vh=(Number(r.volume)||0)/maxVol*volH;c.fillStyle=colorFor(r,i);c.globalAlpha=.72;c.fillRect(x-bar/2,bottom-vh,bar,vh);c.globalAlpha=1}c.fillStyle='#7895ae';c.strokeStyle='#17334c';for(let i=0;i<5;i++){const idx=Math.min(rows.length-1,Math.round(i*(rows.length-1)/4)),x=left+step*idx,label=String(rows[idx].time||rows[idx].date||'').slice(-5);c.fillText(label,Math.max(left,x-17),h-10)}c.fillText('成交量',5,volTop+12);return {left,right,top,bottom,step,py}}
+
+function drawKline(){const d=klineState.data,canvas=document.getElementById('klineCanvas');if(!d||!canvas||!d.rows?.length)return;const allRows=d.rows,total=allRows.length;klineState.visible=Math.max(20,Math.min(total,klineState.visible||120));klineState.offset=Math.max(0,Math.min(Math.max(0,total-klineState.visible),klineState.offset||0));const end=Math.max(klineState.visible,total-klineState.offset),start=Math.max(0,end-klineState.visible),rows=allRows.slice(start,end),w=Math.max(620,canvas.clientWidth||1000),h=Math.max(320,canvas.clientHeight||560),dpr=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);const minute=d.period==='minute',latest=rows[rows.length-1],paint=minute?paintMinuteBase:paintKlineBase,info=minute?minuteRowInfo:klineRowInfo;let geom=paint(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=info(latest);const periodText=minute?'分钟':'根';document.getElementById('klineViewport').textContent=`显示 ${start+1}-${end} / ${total} ${periodText}｜${rows[0].date} 至 ${rows[rows.length-1].date}`;canvas.onmousemove=e=>{const rect=canvas.getBoundingClientRect(),mx=(e.clientX-rect.left)*w/rect.width,idx=Math.max(0,Math.min(rows.length-1,Math.round((mx-geom.left)/Math.max(geom.step,.001))));geom=paint(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=info(rows[idx]);drawKlineCross(c,w,geom,idx,rows)};canvas.onmouseleave=()=>{geom=paint(canvas,c,rows,w,h);document.getElementById('klineInfo').textContent=info(latest)};canvas.onwheel=e=>{e.preventDefault();zoomKline(e.deltaY<0?.8:1.25)};let dragX=null;canvas.onpointerdown=e=>{dragX=e.clientX;canvas.classList.add('dragging');canvas.setPointerCapture?.(e.pointerId)};canvas.onpointerup=e=>{if(dragX==null)return;const dx=e.clientX-dragX;dragX=null;canvas.classList.remove('dragging');if(Math.abs(dx)>35)panKline(dx>0?-1:1)};canvas.onpointercancel=()=>{dragX=null;canvas.classList.remove('dragging')}}
 function drawKlineCross(c,w,geom,idx,rows){const r=rows[idx],x=geom.left+geom.step*(idx+.5),y=geom.py(r.close);c.save();c.setLineDash([4,4]);c.strokeStyle='rgba(210,235,255,.48)';c.beginPath();c.moveTo(x,geom.top);c.lineTo(x,geom.bottom);c.moveTo(geom.left,y);c.lineTo(w-geom.right,y);c.stroke();c.restore()}
 window.addEventListener('resize',()=>{if(document.getElementById('klineModal')?.classList.contains('show'))drawKline()});document.addEventListener('visibilitychange',()=>{if(!document.hidden&&klineState.auto&&klineState.data&&document.getElementById('klineModal')?.classList.contains('show')&&(!klineState.nextRefreshAt||Date.now()>=klineState.nextRefreshAt))loadKline(true)});document.addEventListener('keydown',e=>{if(!document.getElementById('klineModal')?.classList.contains('show'))return;if(e.key==='Escape')closeKline();else if(e.key==='ArrowLeft')panKline(-1);else if(e.key==='ArrowRight')panKline(1);else if(e.key==='+'||e.key==='=')zoomKline(.8);else if(e.key==='-')zoomKline(1.25);else if(e.key.toLowerCase()==='r')refreshKlineNow();else if(e.key.toLowerCase()==='f')toggleKlineFullscreen()});
 

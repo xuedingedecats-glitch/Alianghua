@@ -166,12 +166,43 @@ class KlineTests(unittest.TestCase):
         self.assertIn("function setKlineLimit(limit)", app.SCRIPT)
         self.assertIn("function zoomKline(factor)", app.SCRIPT)
         self.assertIn("function panKline(direction)", app.SCRIPT)
-        self.assertIn("limit=${klineState.limit}", app.SCRIPT)
+        self.assertIn("const limit=isMinutePeriod()?242:klineState.limit", app.SCRIPT)
         self.assertIn("canvas.onwheel", app.SCRIPT)
 
     def test_crosshair_repaints_base_before_drawing(self):
-        self.assertIn("geom=paintKlineBase(canvas,c,rows,w,h);document.getElementById('klineInfo')", app.SCRIPT)
         self.assertIn("drawKlineCross(c,w,geom,idx,rows)", app.SCRIPT)
+        self.assertIn("paintMinuteBase", app.SCRIPT)
+
+    def test_minute_payload_uses_intraday_source_and_returns_full_session_rows(self):
+        source = [
+            {"date": "2026-07-13 09:30", "time": "09:30", "trade_date": "2026-07-13", "open": 10.0, "close": 10.1, "high": 10.1, "low": 10.0, "volume": 100.0, "amount": 101000.0, "average": 10.1},
+            {"date": "2026-07-13 09:31", "time": "09:31", "trade_date": "2026-07-13", "open": 10.1, "close": 10.2, "high": 10.2, "low": 10.0, "volume": 120.0, "amount": 122400.0, "average": 10.15},
+        ]
+        current = app.dt.datetime(2026, 7, 13, 10, 0, 0)
+        with mock.patch.object(app, "now_cn", return_value=current), \
+             mock.patch.object(app, "_chart_intraday_bars", return_value=(source, "平安银行", "测试分时源", 10.0)) as fetch, \
+             mock.patch.object(app, "_chart_daily_bars") as daily_fetch:
+            result = app.kline_payload("000001", "minute", 1)
+        fetch.assert_called_once_with("000001")
+        daily_fetch.assert_not_called()
+        self.assertEqual(result["period"], "minute")
+        self.assertEqual(result["chart_type"], "intraday")
+        self.assertEqual(result["previous_close"], 10.0)
+        self.assertEqual(len(result["rows"]), 2)
+        self.assertEqual(result["latest_bar_time"], "09:31")
+        self.assertIn("分时图为当日 1 分钟行情", result["note"])
+
+    def test_minute_alias_and_page_controls_are_available(self):
+        source = [{"date": "2026-07-13 09:30", "time": "09:30", "trade_date": "2026-07-13", "open": 10.0, "close": 10.1, "high": 10.1, "low": 10.0, "volume": 100.0, "amount": 101000.0, "average": 10.1}]
+        with mock.patch.object(app, "_chart_intraday_bars", return_value=(source, "平安银行", "测试分时源", 10.0)):
+            result = app.kline_payload("000001", "intraday", 120)
+        self.assertEqual(result["period"], "minute")
+        html = app.page_html({"has_data": True, "rows": [{"code": "000001", "name": "平安银行"}], "watchlist": {}, "group_order": ["全部"], "strategy_book": []})
+        for text in ("当日分时", 'data-period="minute"', 'id="klineTools"'):
+            self.assertIn(text, html)
+        for text in ("function paintMinuteBase", "function minuteRowInfo", "isMinutePeriod()"):
+            self.assertIn(text, app.SCRIPT)
+        self.assertTrue(callable(app._chart_intraday_bars))
 
 
 if __name__ == "__main__":

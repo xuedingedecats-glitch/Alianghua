@@ -149,6 +149,10 @@ class KlineTests(unittest.TestCase):
         for text in ("function scheduleKlineRefresh", "function setKlineAutoRefresh", "行情截止", "非交易时段约5分钟", "oldVisible", "oldOffset", "cache:'no-store'", "refresh=1", "刷新中…", "klineRefreshStatus", "下次自动刷新", "clearKlineRefreshTimers", "onpointerdown", "visibilitychange", "refreshBtn.disabled=false", "scheduleKlineRefresh(60)"):
             self.assertIn(text, app.SCRIPT)
 
+    def test_homepage_opens_kline_modal_from_valid_url_parameter(self):
+        for text in ("function openKlineFromUrl", "new URL(location.href)", "url.searchParams.get('kline')", "history.replaceState", "setTimeout(()=>openKline(code),40)"):
+            self.assertIn(text, app.SCRIPT)
+
     def test_kline_supports_countdown_drag_and_keyboard_navigation(self):
         for text in ("nextRefreshAt", "setInterval(updateKlineRefreshStatus,1000)", "panKline(dx>0?-1:1)", "ArrowLeft", "ArrowRight", "touch-action:none"):
             self.assertIn(text, app.SCRIPT + app.STYLE)

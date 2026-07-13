@@ -99,6 +99,10 @@ class WebSecurityTests(unittest.TestCase):
         for text in ("riskCapital", "riskPct", "maxPosPct", "portfolioPct", "portfolioRiskPct", "portfolioSummary", "buildPortfolioPlans", "exportOpeningCsv", "仓位预案", "最近自动核验轨迹"):
             self.assertIn(text, page)
         self.assertIn("sessionStorage.setItem('opening_risk_settings'", page)
+        self.assertIn("function openOpeningKline", page)
+        self.assertIn("onclick=\"openOpeningKline(&quot;000001&quot;)\"", page)
+        self.assertIn("data-opening-code", page)
+        self.assertIn("在新标签页打开K线图", page)
         self.assertNotIn("胜率优先", page)
 
 

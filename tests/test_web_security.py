@@ -63,7 +63,7 @@ class WebSecurityTests(unittest.TestCase):
             out.mkdir(parents=True)
             payload = {"checked_at": "2026-07-10 09:45:00", "source_date": "2026-07-09", "summary": {"total": 8, "eligible": 2, "wait": 3, "avoid": 2, "unready": 1}}
             (out / "opening_20260710_0945.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            with mock.patch.object(app, "REPORT_DIR", report_dir):
+            with mock.patch.object(app, "REPORT_DIR", report_dir), mock.patch.object(app, "now_cn", return_value=dt.datetime(2026, 7, 10, 12, 0)):
                 items = app.opening_history_payload()
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["eligible"], 2)
@@ -77,7 +77,7 @@ class WebSecurityTests(unittest.TestCase):
             (out / "opening_20260710_0950.json").write_text("{broken", encoding="utf-8")
             with (out / "opening_20260710_0955.json").open("wb") as fh:
                 fh.truncate(2 * 1024 * 1024 + 1)
-            with mock.patch.object(app, "REPORT_DIR", report_dir):
+            with mock.patch.object(app, "REPORT_DIR", report_dir), mock.patch.object(app, "now_cn", return_value=dt.datetime(2026, 7, 10, 12, 0)):
                 self.assertEqual(app.opening_history_payload(), [])
 
     def test_opening_page_contains_risk_export_and_history_tools(self):
@@ -96,7 +96,7 @@ class WebSecurityTests(unittest.TestCase):
             "checked_at": "2026-07-10 09:45:00", "message": "测试",
         }
         page = app.opening_page_html(payload)
-        for text in ("riskCapital", "riskPct", "maxPosPct", "portfolioPct", "portfolioRiskPct", "portfolioSummary", "buildPortfolioPlans", "exportOpeningCsv", "仓位预案", "最近自动核验轨迹"):
+        for text in ("riskCapital", "riskPct", "maxPosPct", "portfolioPct", "portfolioRiskPct", "portfolioSummary", "buildPortfolioPlans", "exportOpeningCsv", "仓位预案", "最近三日自动核验轨迹", "查看详情", "/opening/detail?file=", "近3日"):
             self.assertIn(text, page)
         self.assertIn("sessionStorage.setItem('opening_risk_settings'", page)
         self.assertIn("function openOpeningKline", page)
@@ -148,6 +148,57 @@ class WebSecurityTests(unittest.TestCase):
                 app.OPENING_REFRESH_LOCK.release()
             self.assertTrue(result.get("refreshing"))
             fetch.assert_not_called()
+
+    def test_opening_history_keeps_only_three_calendar_days(self):
+        with tempfile.TemporaryDirectory() as td:
+            report_dir = Path(td); out = report_dir / "opening_checks"; out.mkdir(parents=True)
+            for day in ("20260713", "20260712", "20260711", "20260710"):
+                (out / f"opening_{day}_0935.json").write_text(json.dumps({"checked_at": day, "summary": {}}), encoding="utf-8")
+            with mock.patch.object(app, "REPORT_DIR", report_dir), mock.patch.object(app, "now_cn", return_value=dt.datetime(2026, 7, 13, 12, 0)):
+                items = app.opening_history_payload(20)
+            self.assertEqual([x["file"] for x in items], ["opening_20260713_0935.json", "opening_20260712_0935.json", "opening_20260711_0935.json"])
+            self.assertFalse((out / "opening_20260710_0935.json").exists())
+
+    def test_opening_detail_compares_snapshot_and_current_quote(self):
+        with tempfile.TemporaryDirectory() as td:
+            report_dir = Path(td); out = report_dir / "opening_checks"; out.mkdir(parents=True)
+            name = "opening_20260713_0935.json"
+            snapshot = {"checked_at": "2026-07-13 09:35:00", "source_date": "2026-07-10", "summary": {"total": 1}, "rows": [{
+                "code": "000001", "name": "平安银行", "status": "可计划内执行", "score": 88, "strategy": "测试战法", "strategy_group": "趋势动量类", "reason": "条件通过", "action": "小仓分批", "buy_zone": "10~11", "stop_loss": 9.5,
+                "checks": [{"name": "计划价格", "pass": True, "text": "通过"}],
+                "monitor_baseline": {"price": 10.0, "added_at": "2026-07-10 15:35:00", "source": "手动添加监控", "price_source": "公开行情快照"},
+                "quote": {"price": 10.5, "trade_time": "2026-07-13 09:35:00", "source": "历史快照"},
+            }]}
+            (out / name).write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+            quote = {"ok": True, "price": 11.0, "trade_time": "2026-07-13 10:00:00", "source": "当前公开行情"}
+            with mock.patch.object(app, "REPORT_DIR", report_dir), mock.patch.object(app, "fetch_live_quote", return_value=quote):
+                result = app.opening_detail_payload(name)
+            self.assertTrue(result["ok"])
+            row = result["rows"][0]
+            self.assertEqual(row["snapshot_change_pct"], 5.0)
+            self.assertEqual(row["current_change_pct"], 10.0)
+            self.assertEqual(row["current_quote"]["source"], "当前公开行情")
+            page = app.opening_detail_page_html(result)
+            for label in ("加入监控基准价", "本次核验价（历史快照）", "当前行情（打开详情时获取）", "openDetailKline"):
+                self.assertIn(label, page)
+
+    def test_opening_detail_rejects_invalid_file_name_without_quote_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(app, "REPORT_DIR", Path(td)), mock.patch.object(app, "fetch_live_quote") as fetch:
+                result = app.opening_detail_payload("../../opening_20260713_0935.json")
+            self.assertFalse(result["ok"])
+            fetch.assert_not_called()
+
+    def test_manual_watch_add_captures_monitor_baseline(self):
+        with tempfile.TemporaryDirectory() as td:
+            watch_file = Path(td) / "opening_watchlist.json"
+            quote = {"ok": True, "price": 10.25, "name": "测试股份", "source": "测试行情"}
+            with mock.patch.object(app, "WATCHLIST_FILE", watch_file), mock.patch.object(app, "fetch_live_quote", return_value=quote), mock.patch.object(app, "latest_signal_file", return_value=None):
+                result = app.update_watch_codes("add", ["000001"])
+                state = app.load_watch_state()
+            self.assertIn("000001", result["codes"])
+            self.assertEqual(state["monitor_baselines"]["000001"]["price"], 10.25)
+            self.assertEqual(state["monitor_baselines"]["000001"]["source"], "手动添加监控")
 
     def test_opening_snapshot_is_written_atomically(self):
         with tempfile.TemporaryDirectory() as td:

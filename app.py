@@ -10,7 +10,7 @@ import requests
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("QUANT_WEB_DATA_DIR", str(BASE_DIR))).expanduser().resolve()
@@ -23,6 +23,9 @@ DEFAULT_SCHEDULE = os.environ.get("QUANT_WEB_SCHEDULE", "15:35,21:00")
 OPENING_SCHEDULE = os.environ.get("QUANT_WEB_OPENING_SCHEDULE", "09:35,09:50,10:15,10:30")
 OPENING_CHECK_LIMIT = int(os.environ.get("QUANT_WEB_OPENING_CHECK_LIMIT", "40"))
 OPENING_CACHE_TTL = int(os.environ.get("QUANT_WEB_OPENING_CACHE_TTL", "90"))
+OPENING_HISTORY_RETENTION_DAYS = 3
+OPENING_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
+MAX_OPENING_DETAIL_ROWS = 100
 DEFAULT_TOP = int(os.environ.get("QUANT_WEB_TOP", "80"))
 DEFAULT_MAX_STOCKS = int(os.environ.get("QUANT_WEB_MAX_STOCKS", "1200"))
 DEFAULT_FULL = os.environ.get("QUANT_WEB_FULL", "1").lower() not in ("0","false","no")
@@ -378,6 +381,51 @@ def _normal_auto_sync(value: Any) -> Dict[str, Any]:
         top_n = AUTO_SYNC_DEFAULT_LIMIT
     return {"enabled": bool(raw.get("enabled", False)), "top_n": max(1, min(top_n, min(MAX_WATCHLIST, 40))), "min_score": AUTO_SYNC_MIN_SCORE, "last_synced_at": str(raw.get("last_synced_at") or ""), "last_signal_file": str(raw.get("last_signal_file") or "")}
 
+def _normal_monitor_baselines(value: Any) -> Dict[str, Dict[str, Any]]:
+    raw = value if isinstance(value, dict) else {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for raw_code, item in raw.items():
+        try:
+            code = clean_stock_code(raw_code)
+        except ValueError:
+            continue
+        item = item if isinstance(item, dict) else {}
+        price = nullable_float(item.get("price"), 4)
+        if price is not None and price <= 0:
+            price = None
+        out[code] = {
+            "price": price,
+            "added_at": str(item.get("added_at") or "")[:32],
+            "price_source": str(item.get("price_source") or "")[:80],
+            "source": str(item.get("source") or "")[:80],
+            "name": str(item.get("name") or "")[:80],
+        }
+    return out
+
+def _capture_monitor_baseline(code: str, source: str, name: str = "") -> Dict[str, Any]:
+    baseline = {"price": None, "added_at": now_cn().strftime("%Y-%m-%d %H:%M:%S"), "price_source": "行情暂不可用", "source": source, "name": name or code}
+    try:
+        quote_info = fetch_live_quote(code)
+    except Exception:
+        quote_info = {}
+    price = nullable_float((quote_info or {}).get("price"), 4)
+    if price is not None and price > 0:
+        baseline["price"] = price
+        baseline["price_source"] = str((quote_info or {}).get("source") or "公开行情快照")[:80]
+        baseline["name"] = str((quote_info or {}).get("name") or name or code)[:80]
+    return baseline
+
+def _baseline_from_signal(row: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(row.get("code") or "")
+    price = nullable_float(row.get("close"), 4)
+    return {
+        "price": price if price is not None and price > 0 else None,
+        "added_at": now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+        "price_source": "收盘扫描收盘价" if price is not None and price > 0 else "收盘扫描未提供收盘价",
+        "source": "自动同步收盘推荐",
+        "name": str(row.get("name") or code)[:80],
+    }
+
 def _read_watch_state_unlocked() -> Dict[str, Any]:
     try:
         raw = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8")) if WATCHLIST_FILE.exists() else {}
@@ -388,7 +436,9 @@ def _read_watch_state_unlocked() -> Dict[str, Any]:
     manual = _clean_codes(raw.get("manual_codes") if isinstance(raw.get("manual_codes"), list) else raw.get("codes", []))
     auto = [code for code in _clean_codes(raw.get("auto_codes", [])) if code not in manual]
     excluded = [code for code in _clean_codes(raw.get("excluded_auto_codes", [])) if code in auto and code not in manual]
-    return {"manual_codes": manual, "auto_codes": auto, "excluded_auto_codes": excluded, "auto_sync": _normal_auto_sync(raw.get("auto_sync"))}
+    active = set(manual) | set(auto)
+    baselines = {code: item for code, item in _normal_monitor_baselines(raw.get("monitor_baselines")).items() if code in active}
+    return {"manual_codes": manual, "auto_codes": auto, "excluded_auto_codes": excluded, "auto_sync": _normal_auto_sync(raw.get("auto_sync")), "monitor_baselines": baselines}
 
 def _effective_watch_codes(state: Dict[str, Any]) -> List[str]:
     manual = list(state.get("manual_codes") or [])
@@ -400,6 +450,8 @@ def _write_watch_state_unlocked(state: Dict[str, Any]) -> Dict[str, Any]:
     payload = {"updated_at": now_cn().strftime("%Y-%m-%d %H:%M:%S"), "manual_codes": _clean_codes(state.get("manual_codes", [])), "auto_codes": _clean_codes(state.get("auto_codes", [])), "excluded_auto_codes": _clean_codes(state.get("excluded_auto_codes", [])), "auto_sync": _normal_auto_sync(state.get("auto_sync"))}
     # 保留 codes 方便旧版本/人工查看，同时新版本以 manual_codes + auto_codes 管理来源。
     payload["codes"] = _effective_watch_codes(payload)
+    raw_baselines = _normal_monitor_baselines(state.get("monitor_baselines"))
+    payload["monitor_baselines"] = {code: raw_baselines[code] for code in payload["codes"] if code in raw_baselines}
     temp = WATCHLIST_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(WATCHLIST_FILE)
@@ -418,21 +470,39 @@ def load_watch_codes() -> List[str]:
 
 def update_watch_codes(mode: str, codes: List[Any]) -> Dict[str, Any]:
     incoming = _clean_codes(codes)
+    baseline_needed: List[str] = []
+    source = "手动添加监控" if mode == "add" else "手动替换监控"
     with WATCHLIST_LOCK:
-        state = _read_watch_state_unlocked(); manual = list(state["manual_codes"]); auto = set(state["auto_codes"]); excluded = set(state["excluded_auto_codes"])
+        state = _read_watch_state_unlocked()
+        before = set(_effective_watch_codes(state))
+        manual = list(state["manual_codes"]); auto = set(state["auto_codes"]); excluded = set(state["excluded_auto_codes"])
         if mode == "replace":
             state["manual_codes"] = incoming
             # "清空/替换" 应即时只保留用户选择；下一交易日自动同步会生成新候选。
             state["excluded_auto_codes"] = [code for code in state["auto_codes"] if code not in incoming]
+            baseline_needed = [code for code in incoming if code not in before]
         elif mode == "add":
             state["manual_codes"] = (manual + [code for code in incoming if code not in manual])[:MAX_WATCHLIST]
             state["excluded_auto_codes"] = [code for code in excluded if code not in incoming]
+            baseline_needed = [code for code in incoming if code not in before]
         elif mode == "remove":
             state["manual_codes"] = [code for code in manual if code not in incoming]
             state["excluded_auto_codes"] = list(excluded | (auto & set(incoming)))
         else:
             raise ValueError("不支持的清单更新方式")
         _write_watch_state_unlocked(state)
+    # 仅对本次新加入的代码记录当时公开行情，不会为旧清单伪造历史加入价。
+    captured = {code: _capture_monitor_baseline(code, source) for code in baseline_needed}
+    if captured:
+        with WATCHLIST_LOCK:
+            state = _read_watch_state_unlocked()
+            active = set(_effective_watch_codes(state))
+            baselines = _normal_monitor_baselines(state.get("monitor_baselines"))
+            for code, baseline in captured.items():
+                if code in active and code not in baselines:
+                    baselines[code] = baseline
+            state["monitor_baselines"] = baselines
+            _write_watch_state_unlocked(state)
     _invalidate_opening_cache()
     return watchlist_payload()
 
@@ -508,20 +578,34 @@ def sync_auto_watchlist() -> Dict[str, Any]:
         if not cfg["enabled"]:
             return {"synced": False, "reason": "自动同步未开启"}
         # 先限制同类集中度，再按总分补足，避免监控池被单一战法/板块风格占满。
-        selected: List[str] = []; group_counts: Dict[str, int] = {}
+        selected_rows: List[Dict[str, Any]] = []; group_counts: Dict[str, int] = {}
         for row in ranked:
             primary = str(row.get("strategy_group") or "综合类").split("+")[0]
-            if group_counts.get(primary, 0) >= 3: continue
-            selected.append(str(row["code"])); group_counts[primary] = group_counts.get(primary, 0) + 1
-            if len(selected) >= cfg["top_n"]: break
-        if len(selected) < cfg["top_n"]:
+            if group_counts.get(primary, 0) >= 3:
+                continue
+            selected_rows.append(row); group_counts[primary] = group_counts.get(primary, 0) + 1
+            if len(selected_rows) >= cfg["top_n"]:
+                break
+        if len(selected_rows) < cfg["top_n"]:
+            chosen = {str(row.get("code")) for row in selected_rows}
             for row in ranked:
-                code = str(row["code"])
-                if code not in selected: selected.append(code)
-                if len(selected) >= cfg["top_n"]: break
+                if str(row.get("code")) not in chosen:
+                    selected_rows.append(row); chosen.add(str(row.get("code")))
+                if len(selected_rows) >= cfg["top_n"]:
+                    break
+        selected = [str(row["code"]) for row in selected_rows]
+        previous_signal = str(cfg.get("last_signal_file") or "")
         state["auto_codes"] = selected
         # 新的收盘信号到来后，重新给用户展示新的自动候选；手动股票始终保留。
         state["excluded_auto_codes"] = []
+        if previous_signal != signal.name:
+            baselines = _normal_monitor_baselines(state.get("monitor_baselines"))
+            manual = set(state.get("manual_codes") or [])
+            for row in selected_rows:
+                code = str(row["code"])
+                if code not in manual:
+                    baselines[code] = _baseline_from_signal(row)
+            state["monitor_baselines"] = baselines
         cfg["last_synced_at"] = now_cn().strftime("%Y-%m-%d %H:%M:%S"); cfg["last_signal_file"] = signal.name; state["auto_sync"] = cfg
         _write_watch_state_unlocked(state)
     _invalidate_opening_cache()
@@ -529,13 +613,14 @@ def sync_auto_watchlist() -> Dict[str, Any]:
 
 def watchlist_payload() -> Dict[str, Any]:
     state = load_watch_state(); codes = _effective_watch_codes(state); manual = set(state.get("manual_codes") or []); auto = set(state.get("auto_codes") or [])
+    baselines = _normal_monitor_baselines(state.get("monitor_baselines"))
     rows = consolidate_signal_rows(read_csv_dict(latest_signal_file())) if latest_signal_file() else []
     mapped: Dict[str, Dict[str, Any]] = {str(row["code"]): row for row in rows}
     items = []
     for code in codes:
         source = "手动添加" if code in manual else ("自动同步的收盘推荐" if code in auto else "自定义代码")
-        items.append({"code": code, "name": (mapped.get(code) or {}).get("name") or code, "source": source, "strategy": (mapped.get(code) or {}).get("strategy") or "自定义保守趋势确认"})
-    return {"codes": codes, "count": len(codes), "max": MAX_WATCHLIST, "manual_count": len(manual), "auto_count": len([code for code in codes if code in auto and code not in manual]), "auto_sync": state.get("auto_sync") or _normal_auto_sync({}), "items": items}
+        items.append({"code": code, "name": (mapped.get(code) or {}).get("name") or (baselines.get(code) or {}).get("name") or code, "source": source, "strategy": (mapped.get(code) or {}).get("strategy") or "自定义保守趋势确认", "baseline": baselines.get(code)})
+    return {"codes": codes, "count": len(codes), "max": MAX_WATCHLIST, "manual_count": len(manual), "auto_count": len([code for code in codes if code in auto and code not in manual]), "auto_sync": state.get("auto_sync") or _normal_auto_sync({}), "baseline_by_code": {code: baselines[code] for code in codes if code in baselines}, "items": items}
 
 def opening_session() -> Dict[str, Any]:
     """返回中国交易时段状态；交易所休市日由实时行情可用性作二次保护。"""
@@ -842,34 +927,138 @@ def opening_decision(row: Dict[str, Any], quote: Dict[str, Any]) -> Dict[str, An
     else: result.update(status="等待确认",rank=1,reason=("当前不在计划买入区间" if not in_zone else "开盘承接尚未确认")+"；不追涨、不抄底，等待条件同步满足。")
     return result
 
+def _opening_snapshot_datetime(name: str) -> Optional[dt.datetime]:
+    match = re.fullmatch(r"opening_(\d{8})_(\d{4})\.json", str(name or ""))
+    if not match:
+        return None
+    try:
+        return dt.datetime.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M")
+    except ValueError:
+        return None
+
+def _opening_snapshot_path(raw_file: Any) -> Optional[Path]:
+    name = Path(str(raw_file or "")).name
+    if name != str(raw_file or "") or _opening_snapshot_datetime(name) is None:
+        return None
+    path = REPORT_DIR / "opening_checks" / name
+    try:
+        if not path.is_file() or path.resolve().parent != (REPORT_DIR / "opening_checks").resolve():
+            return None
+        if path.stat().st_size > OPENING_SNAPSHOT_MAX_BYTES:
+            return None
+    except OSError:
+        return None
+    return path
+
+def prune_opening_checks(out_dir: Optional[Path] = None, reference: Optional[dt.datetime] = None) -> int:
+    """只保留当前自然日及前两日的定时核验快照。"""
+    out_dir = out_dir or (REPORT_DIR / "opening_checks")
+    if not out_dir.exists():
+        return 0
+    cutoff = (reference or now_cn()).date() - dt.timedelta(days=OPENING_HISTORY_RETENTION_DAYS - 1)
+    removed = 0
+    for path in out_dir.glob("opening_*.json"):
+        stamp = _opening_snapshot_datetime(path.name)
+        if stamp is not None and stamp.date() < cutoff:
+            try:
+                path.unlink(); removed += 1
+            except OSError:
+                pass
+    return removed
+
+def _read_opening_snapshot(raw_file: Any) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    path = _opening_snapshot_path(raw_file)
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return (path, payload) if isinstance(payload, dict) else None
+
+def _opening_change_pct(price: Any, baseline: Any) -> Optional[float]:
+    current = nullable_float(price, 4); start = nullable_float(baseline, 4)
+    if current is None or start is None or current <= 0 or start <= 0:
+        return None
+    return round((current / start - 1) * 100, 2)
+
 def opening_history_payload(limit: int = 12) -> List[Dict[str, Any]]:
-    """读取最近的自动开盘核验快照，只返回页面复盘需要的汇总字段。"""
+    """读取最近三日的自动开盘核验快照，只返回页面复盘需要的汇总字段。"""
     out_dir = REPORT_DIR / "opening_checks"
+    prune_opening_checks(out_dir)
     items: List[Dict[str, Any]] = []
     if not out_dir.exists():
         return items
     safe_limit = max(1, min(int(limit), 50))
-    for path in sorted(out_dir.glob("opening_*.json"), reverse=True)[:safe_limit]:
-        try:
-            if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
-                continue
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                continue
-            summary = payload.get("summary") or {}
-            items.append({
-                "file": path.name,
-                "checked_at": str(payload.get("checked_at") or ""),
-                "source_date": str(payload.get("source_date") or ""),
-                "total": int(safe_float(summary.get("total"))),
-                "eligible": int(safe_float(summary.get("eligible"))),
-                "wait": int(safe_float(summary.get("wait"))),
-                "avoid": int(safe_float(summary.get("avoid"))),
-                "unready": int(safe_float(summary.get("unready"))),
-            })
-        except (OSError, ValueError, TypeError):
+    paths = sorted((p for p in out_dir.glob("opening_*.json") if _opening_snapshot_datetime(p.name) is not None), reverse=True)
+    for path in paths[:safe_limit]:
+        read = _read_opening_snapshot(path.name)
+        if read is None:
             continue
+        _, payload = read
+        summary = payload.get("summary") or {}
+        items.append({
+            "file": path.name,
+            "checked_at": str(payload.get("checked_at") or ""),
+            "source_date": str(payload.get("source_date") or ""),
+            "total": int(safe_float(summary.get("total"))),
+            "eligible": int(safe_float(summary.get("eligible"))),
+            "wait": int(safe_float(summary.get("wait"))),
+            "avoid": int(safe_float(summary.get("avoid"))),
+            "unready": int(safe_float(summary.get("unready"))),
+        })
     return items
+
+def opening_detail_payload(raw_file: Any) -> Dict[str, Any]:
+    # 详情接口也执行清理，避免仅凭旧文件名绕过最近三日留存规则。
+    prune_opening_checks()
+    read = _read_opening_snapshot(raw_file)
+    if read is None:
+        return {"ok": False, "message": "核验详情不存在、文件格式不正确或已超过最近三日保留期。", "rows": []}
+    path, payload = read
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    rows = [dict(row) for row in rows[:MAX_OPENING_DETAIL_ROWS] if isinstance(row, dict)]
+    codes: List[str] = []
+    for row in rows:
+        try:
+            code = clean_stock_code(row.get("code")); row["code"] = code
+        except ValueError:
+            continue
+        if code not in codes:
+            codes.append(code)
+    def fetch_one(code: str) -> Tuple[str, Dict[str, Any]]:
+        try:
+            return code, fetch_live_quote(code)
+        except Exception as exc:
+            return code, {"ok": False, "code": code, "source": "当前行情获取失败", "error": type(exc).__name__, "fetched_at": now_cn().strftime("%Y-%m-%d %H:%M:%S")}
+    latest: Dict[str, Dict[str, Any]] = {}
+    if codes:
+        with futures.ThreadPoolExecutor(max_workers=min(10, len(codes))) as ex:
+            for code, quote_info in ex.map(fetch_one, codes):
+                latest[code] = quote_info if isinstance(quote_info, dict) else {}
+    detail_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        code = str(row.get("code") or "")
+        if not code:
+            continue
+        baseline = row.get("monitor_baseline") if isinstance(row.get("monitor_baseline"), dict) else {}
+        quote_snapshot = row.get("quote") if isinstance(row.get("quote"), dict) else {}
+        current = latest.get(code) or {}
+        baseline_price = nullable_float(baseline.get("price"), 4)
+        snapshot_price = nullable_float(quote_snapshot.get("price"), 4)
+        current_price = nullable_float(current.get("price"), 4)
+        detail = dict(row)
+        detail.update({
+            "monitor_baseline": baseline,
+            "baseline_price": baseline_price,
+            "snapshot_price": snapshot_price,
+            "snapshot_change_pct": _opening_change_pct(snapshot_price, baseline_price),
+            "current_quote": current,
+            "current_price": current_price,
+            "current_change_pct": _opening_change_pct(current_price, baseline_price),
+        })
+        detail_rows.append(detail)
+    return {"ok": True, "file": path.name, "checked_at": str(payload.get("checked_at") or ""), "source_date": str(payload.get("source_date") or ""), "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else {}, "message": "历史核验价为保存快照；当前行情在打开详情时重新获取，二者均相对加入监控时的基准价计算涨跌。", "rows": detail_rows}
 
 
 def opening_check_payload(force: bool = False) -> Dict[str, Any]:
@@ -911,6 +1100,12 @@ def opening_check_payload(force: bool = False) -> Dict[str, Any]:
         with futures.ThreadPoolExecutor(max_workers=min(10,max(1,len(ranked)))) as ex:
             for code,quote in ex.map(one,ranked): quotes[code]=quote
         out=[opening_decision(row,quotes.get(clean_stock_code(row.get("code")),{})) for row in ranked]; out.sort(key=lambda r:(r["rank"],-safe_float(r.get("score")),r["code"]))
+        # 记录本次核验所对应的加入监控基准，防止后续清单变动后历史对比失真。
+        baseline_by_code = watch.get("baseline_by_code") or {}
+        for item in out:
+            baseline = baseline_by_code.get(str(item.get("code") or ""))
+            if isinstance(baseline, dict):
+                item["monitor_baseline"] = dict(baseline)
         summary={"total":len(out),"eligible":sum(r["status"]=="可计划内执行" for r in out),"wait":sum(r["status"] in ("等待确认","等待人工确认") for r in out),"avoid":sum(r["status"] in ("不建议参与","不建议追高") for r in out),"unready":sum(r["status"]=="行情未就绪" for r in out)}
         payload={"ok":True,"cached":False,"session":session,"message":"开盘确认采用保守多条件确认模型，基于前一交易日信号与公开行情快照；不会自动下单。","checked_at":now_cn().strftime("%Y-%m-%d %H:%M:%S"),"rows":out,"summary":summary,**common}
         with OPENING_LOCK: OPENING_CACHE.update({"at":time.time(),"source":cache_key,"payload":payload})
@@ -922,6 +1117,7 @@ def save_opening_check(payload: Dict[str, Any]) -> Optional[Path]:
     if not payload.get("rows"):
         return None
     out_dir = REPORT_DIR / "opening_checks"; out_dir.mkdir(parents=True, exist_ok=True)
+    prune_opening_checks(out_dir)
     p = out_dir / f"opening_{now_cn().strftime('%Y%m%d_%H%M')}.json"
     temp = p.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1267,6 +1463,45 @@ def page_html(payload: Dict[str,Any]) -> str:
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>A股量化推荐驾驶舱</title><style>{STYLE}</style></head><body><div class="bg-orb one"></div><div class="bg-orb two"></div><main class="wrap" id="app"></main><div class="modal" id="modal"><div class="modal-card"><button class="x" onclick="hideReport()">×</button><h2>Markdown报告</h2><pre id="reportText"></pre></div></div><div class="modal kline-modal" id="klineModal"><div class="modal-card kline-card"><button class="x kline-close" onclick="closeKline()">×</button><div class="kline-head"><div><span class="eyebrow">前复权行情 · 仅供技术复盘</span><h2 id="klineTitle">K线图</h2><div id="klineMeta" class="small muted"></div></div><div class="kline-actions"><button class="filter-btn active" data-period="day" onclick="setKlinePeriod('day')">日线</button><button class="filter-btn" data-period="week" onclick="setKlinePeriod('week')">周线</button><button class="filter-btn" data-period="month" onclick="setKlinePeriod('month')">月线</button><button class="filter-btn" id="klineFullscreenBtn" onclick="toggleKlineFullscreen()">全屏</button><button class="filter-btn" id="klineRefreshBtn" onclick="refreshKlineNow()">刷新行情</button><label class="kline-auto"><input id="klineAuto" type="checkbox" checked onchange="setKlineAutoRefresh(this.checked)">自动刷新</label><button class="filter-btn" onclick="klineToFundamental()">查看基本面</button></div></div><div class="kline-tools"><div id="klineMa" class="kline-ma"></div><div class="kline-range"><span class="small muted">历史范围</span><button class="filter-btn" data-limit="120" onclick="setKlineLimit(120)">120根</button><button class="filter-btn active" data-limit="240" onclick="setKlineLimit(240)">240根</button><button class="filter-btn" data-limit="480" onclick="setKlineLimit(480)">480根</button><button class="filter-btn" data-limit="640" onclick="setKlineLimit(640)">640根</button><span class="kline-divider"></span><button class="filter-btn" onclick="panKline(-1)">← 较早</button><button class="filter-btn" onclick="zoomKline(.7)">＋ 放大</button><button class="filter-btn" onclick="zoomKline(1.4)">－ 缩小</button><button class="filter-btn" onclick="panKline(1)">较新 →</button><button class="filter-btn" onclick="resetKlineView()">回到最新</button></div></div><div class="kline-status"><div id="klineInfo" class="kline-info">点击代码后加载K线数据</div><div class="kline-status-right"><div id="klineViewport" class="small muted"></div><div id="klineRefreshStatus" class="kline-refresh-status">等待刷新计划</div></div></div><div class="kline-canvas-wrap"><canvas id="klineCanvas" aria-label="股票K线图"></canvas><div id="klineLoading" class="kline-loading">正在加载K线…</div></div><div class="small muted kline-note" id="klineNote">红色为上涨，绿色为下跌；均线随所选日/周/月周期计算。鼠标滚轮可缩放，按住图表左右拖拽可浏览历史，方向键也可平移。</div></div></div><script>window.__DATA__={data};{SCRIPT}</script></body></html>'''
 
 
+def opening_detail_page_html(payload: Dict[str, Any]) -> str:
+    def esc(value: Any) -> str:
+        return html.escape(str(value if value not in (None, "") else "-"))
+    def price(value: Any) -> str:
+        number = nullable_float(value, 4)
+        return "-" if number is None or number <= 0 else f"{number:.2f}"
+    def change(value: Any) -> str:
+        number = nullable_float(value, 2)
+        if number is None:
+            return '<span class="muted">基准价未记录</span>'
+        klass = "up" if number > 0 else ("down" if number < 0 else "flat")
+        return f'<span class="{klass}">{number:+.2f}%</span>'
+    if not payload.get("ok"):
+        return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>核验详情｜A股量化驾驶舱</title><style>{STYLE}.detail-wrap{{max-width:900px;margin:46px auto;padding:0 18px}}.detail-empty{{padding:28px;border:1px solid #35516e;border-radius:16px;background:#0b1d31;color:#d8eaff}}</style></head><body><main class="detail-wrap"><section class="detail-empty"><h1>开盘核验详情</h1><p>{esc(payload.get("message"))}</p><p><a class="btn" href="/opening">返回开盘建仓确认</a></p></section></main></body></html>'''
+    rows = payload.get("rows") or []
+    cards: List[str] = []
+    for row in rows:
+        baseline = row.get("monitor_baseline") if isinstance(row.get("monitor_baseline"), dict) else {}
+        snapshot = row.get("quote") if isinstance(row.get("quote"), dict) else {}
+        current = row.get("current_quote") if isinstance(row.get("current_quote"), dict) else {}
+        checks = row.get("checks") if isinstance(row.get("checks"), list) else []
+        checks_html = "".join(f'<li class="{"pass" if item.get("pass") else "fail"}"><b>{"✓" if item.get("pass") else "×"}</b> {esc(item.get("name"))}：{esc(item.get("text"))}</li>' for item in checks if isinstance(item, dict)) or '<li class="muted">未保存条件明细</li>'
+        current_time = current.get("trade_time") or current.get("fetched_at") or "-"
+        current_source = current.get("source") or "当前行情未就绪"
+        stale_note = "（可能延迟）" if current.get("stale") else ""
+        cards.append(f'''<article class="detail-card">
+          <div class="detail-head"><div><button type="button" class="code" onclick="openDetailKline(&quot;{esc(row.get("code"))}&quot;)">{esc(row.get("code"))}</button> <b>{esc(row.get("name"))}</b><p>{esc(row.get("status"))}｜评分 {safe_float(row.get("score")):.1f}｜{esc(row.get("strategy_group"))} · {esc(row.get("strategy"))}</p></div><span class="status">{esc(row.get("status"))}</span></div>
+          <div class="price-grid">
+            <section><small>加入监控基准价</small><strong>{price(row.get("baseline_price"))}</strong><em>{esc(baseline.get("added_at") or "未记录加入时间")}</em><p>{esc(baseline.get("source") or "旧快照未保存")}｜{esc(baseline.get("price_source") or "-")}</p></section>
+            <section><small>本次核验价（历史快照）</small><strong>{price(row.get("snapshot_price"))}</strong><em>相对基准 {change(row.get("snapshot_change_pct"))}</em><p>{esc(snapshot.get("trade_time") or payload.get("checked_at"))}｜{esc(snapshot.get("source"))}</p></section>
+            <section><small>当前行情（打开详情时获取）</small><strong>{price(row.get("current_price"))}</strong><em>相对基准 {change(row.get("current_change_pct"))}</em><p>{esc(current_time)}｜{esc(current_source)} {esc(stale_note)}</p></section>
+          </div>
+          <div class="detail-body"><section><h3>本次建仓结论</h3><p>{esc(row.get("reason"))}</p><p class="muted">原计划：{esc(row.get("action"))}｜计划买入区：{esc(row.get("buy_zone"))}｜止损：{price(row.get("stop_loss"))}</p></section><section><h3>条件校验</h3><ul>{checks_html}</ul></section></div>
+        </article>''')
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>核验详情｜A股量化驾驶舱</title><style>{STYLE}
+    .detail-wrap{{max-width:1380px;margin:0 auto;padding:28px 18px 55px}}.detail-hero{{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin:8px 0 18px}}.detail-hero h1{{margin:0 0 8px;font-size:30px}}.detail-hero p{{margin:0;color:var(--muted);line-height:1.7}}.detail-note{{border:1px solid #2d5a7d;background:#092039;color:#cce9ff;padding:13px 15px;border-radius:13px;margin-bottom:16px;line-height:1.65}}.detail-card{{border:1px solid #294966;background:#0b1b2e;border-radius:18px;padding:17px;margin:14px 0;box-shadow:0 12px 28px #00000022}}.detail-head{{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #213f5d;padding-bottom:12px;margin-bottom:13px}}.detail-head p{{margin:7px 0 0;color:#9eb7cf;font-size:13px}}.code{{border:1px solid #4aa1ce;background:#0e3150;color:#a9ecff;padding:4px 8px;border-radius:8px;font-weight:900;cursor:pointer}}.status{{border:1px solid #365b7e;color:#d7efff;border-radius:999px;padding:5px 10px;height:max-content;font-size:13px;font-weight:850}}.price-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px}}.price-grid section{{background:#08182a;border:1px solid #244765;border-radius:13px;padding:12px}}.price-grid small{{display:block;color:#9cb5cc;font-weight:800}}.price-grid strong{{display:block;font-size:25px;color:#f5fbff;margin:7px 0 4px}}.price-grid em{{font-style:normal;font-size:13px}}.price-grid p{{font-size:12px;color:#89a6c0;line-height:1.55;margin:7px 0 0}}.up{{color:#ff7979;font-weight:900}}.down{{color:#4ed6a1;font-weight:900}}.flat{{color:#d3deea;font-weight:900}}.detail-body{{display:grid;grid-template-columns:1.25fr 1fr;gap:14px;margin-top:14px}}.detail-body section{{border-left:3px solid #3b92c7;background:#09182a;border-radius:0 11px 11px 0;padding:10px 12px}}.detail-body h3{{font-size:14px;margin:0 0 9px}}.detail-body p{{font-size:13px;line-height:1.65;margin:0 0 8px}}.detail-body ul{{list-style:none;margin:0;padding:0;display:grid;gap:6px;font-size:12px;line-height:1.55}}.pass b{{color:#48d49e}}.fail b{{color:#ff7777}}@media(max-width:820px){{.detail-hero,.detail-head{{flex-direction:column}}.price-grid,.detail-body{{grid-template-columns:1fr}}}}
+    </style></head><body><main class="detail-wrap"><section class="detail-hero"><div><span class="eyebrow">历史快照 · 当前行情对比</span><h1>开盘建仓核验详情</h1><p>核验时间：{esc(payload.get("checked_at"))}｜收盘信号日：{esc(payload.get("source_date"))}｜共 {safe_float(summary.get("total")):.0f} 只</p></div><div><a class="btn" href="/opening">返回开盘确认</a> <a class="btn" href="/">量化驾驶舱</a></div></section><div class="detail-note">{esc(payload.get("message"))} 若“加入监控基准价”显示未记录，说明该股票来自旧版监控清单或当时行情未能取得，系统不会用今天价格倒推伪造历史基准。</div>{''.join(cards) or '<section class="detail-note">该次快照未保存可展示的股票明细。</section>'}</main><script>function openDetailKline(code){{const clean=String(code||'').replace(/\\D/g,'').slice(0,6);if(!/^(?:00|30|60|68)\\d{{4}}$/.test(clean))return;window.open('/?kline='+encodeURIComponent(clean),'_blank','noopener')}}</script></body></html>'''
+
 def opening_page_html(payload: Dict[str, Any]) -> str:
     def esc(v: Any) -> str:
         return html.escape(str(v if v not in (None, "") else "-"))
@@ -1337,14 +1572,15 @@ function exportOpeningCsv(){if(!openRows.length){alert('当前没有可导出的
     table = "".join(row_html) or '<div class="opening-empty">当前未进入盘中核验时段，因此不读取实时行情、不输出建仓名单。<br>请在交易日 09:35 之后打开或刷新本页。</div>'
 
     history_rows = "".join(
-        f'<tr><td>{esc(x.get("checked_at"))}</td><td>{esc(x.get("source_date"))}</td><td>{safe_float(x.get("total")):.0f}</td><td class="ok-text">{safe_float(x.get("eligible")):.0f}</td><td>{safe_float(x.get("wait")):.0f}</td><td>{safe_float(x.get("avoid")):.0f}</td><td>{safe_float(x.get("unready")):.0f}</td></tr>'
+        f'<tr><td>{esc(x.get("checked_at"))}</td><td>{esc(x.get("source_date"))}</td><td>{safe_float(x.get("total")):.0f}</td><td class="ok-text">{safe_float(x.get("eligible")):.0f}</td><td>{safe_float(x.get("wait")):.0f}</td><td>{safe_float(x.get("avoid")):.0f}</td><td>{safe_float(x.get("unready")):.0f}</td><td><a class="filter-btn" href="/opening/detail?file={quote(str(x.get("file") or ""))}">查看详情</a></td></tr>'
         for x in history
-    ) or '<tr><td colspan="7" class="muted">今天尚无自动核验快照；交易日盘中定时任务执行后会在这里留下轨迹。</td></tr>'
+    ) or '<tr><td colspan="8" class="muted">最近三天尚无自动核验快照；交易日盘中定时任务执行后会在这里留下轨迹。</td></tr>'
+
 
     active = bool(session.get("active"))
     auto_refresh = "setTimeout(()=>location.reload(),120000);" if active else ""
     monitor_desc = (f"当前按自选监控清单核验 {safe_float(watch.get('count')):.0f} 只股票，包含昨日推荐与手动添加代码。" if payload.get("monitor_mode") == "自选监控" else f"当前未设置自选清单，默认核验昨日评分靠前的 {safe_float(payload.get('limit')):.0f} 只候选。")
-    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>开盘建仓确认｜A股量化驾驶舱</title><style>{STYLE}</style></head><body><div class="bg-orb one"></div><div class="bg-orb two"></div><main class="wrap"><section class="opening-hero"><div><span class="eyebrow">前一交易日信号 · 盘中价格确认</span><h1>开盘建仓确认</h1><p>只核验昨天收盘后的候选是否仍满足计划价格与风险条件；系统不会自动下单。</p></div><div class="opening-action"><a class="btn" href="/">返回量化驾驶舱</a><a class="btn" href="/positions">交易复盘台</a><button class="btn primary" onclick="location.reload()">立即刷新</button></div></section><section class="card" style="margin-bottom:16px"><div class="category-head"><div><h2>{esc(session.get("label"))}</h2><p>核验时点：{esc(payload.get("checked_at") or session.get("time"))}｜信号数据日：{esc(payload.get("source_date"))}</p></div><div class="opening-status"><b>自动核验</b><br>交易日 {esc(payload.get("schedule"))}<br><span class="muted">{esc(session.get("next_action"))}</span></div></div><div class="opening-grid"><div class="opening-kpi"><div class="t">核验候选</div><div class="n">{safe_float(summary.get("total")):.0f}</div></div><div class="opening-kpi"><div class="t">可计划内执行</div><div class="n" style="color:#74f0b9">{safe_float(summary.get("eligible")):.0f}</div></div><div class="opening-kpi"><div class="t">等待确认</div><div class="n" style="color:#ffe28b">{safe_float(summary.get("wait")):.0f}</div></div><div class="opening-kpi"><div class="t">不建议参与/追高</div><div class="n" style="color:#ff9ba8">{safe_float(summary.get("avoid")):.0f}</div></div></div><div class="opening-note"><b>保守多条件确认模型：</b>必须同时通过计划价格区间、开盘溢价、止损、开盘承接、昨日评分、RPS60/风险标签等门槛。情绪/涨停类信号只显示“等待人工确认”；手动添加的股票还需通过 MA20/MA60、多头斜率、量能和乖离门槛。任一关键条件失败就等待或放弃，不为凑数量降低标准。{esc(payload.get("message"))}</div></section><section class="card risk-planner"><div class="category-head"><div><h2>早盘风险预算与仓位预案</h2><p>按账户风险预算和单股仓位上限计算整手数量，取两种限制中的较小值。参数只保存在当前浏览器标签页。</p></div><button class="btn" onclick="exportOpeningCsv()">导出当前核验CSV</button></div><div class="risk-controls"><label>账户资金（元）<input id="riskCapital" type="number" min="1000" step="1000" value="100000" oninput="saveRiskSettings()"></label><label>单笔最大风险（%）<input id="riskPct" type="number" min="0.1" max="10" step="0.1" value="0.5" oninput="saveRiskSettings()"></label><label>单股仓位上限（%）<input id="maxPosPct" type="number" min="1" max="100" step="1" value="20" oninput="saveRiskSettings()"></label><label>组合总仓位上限（%）<input id="portfolioPct" type="number" min="1" max="100" step="1" value="60" oninput="saveRiskSettings()"></label><label>组合总止损风险（%）<input id="portfolioRiskPct" type="number" min="0.1" max="20" step="0.1" value="2" oninput="saveRiskSettings()"></label></div><div id="portfolioSummary" class="portfolio-summary">组合预案等待盘中核验结果</div><div class="small muted">系统按页面排序依次分配仓位，同时受单股风险、单股仓位、组合总仓位和组合总止损风险约束。只有“可计划内执行”的股票占用组合预算；其余股票仅作比较预案。</div></section><section class="card"><div class="category-head"><div><h2>盘中核验明细</h2><p>{esc(monitor_desc)} 状态为“可计划内执行”也不代表保证收益，实际执行仍应采用预设止损与风险预算。</p></div><span class="pill">公开行情快照</span></div><div class="opening-table">{('<table><thead><tr><th>股票</th><th>建仓状态</th><th>战法</th><th>现价</th><th>开盘表现</th><th>昨日计划</th><th>仓位预案</th><th>条件校验</th><th>执行说明</th></tr></thead><tbody>'+table+'</tbody></table>') if rows else table}</div></section><section class="card opening-history"><div class="category-head"><div><h2>最近自动核验轨迹</h2><p>展示最近保存的开盘核验快照，用来确认系统是否按时运行，以及结论在早盘阶段如何变化。</p></div><span class="pill">最近 {len(history)} 次</span></div><div class="opening-table"><table><thead><tr><th>核验时间</th><th>信号日</th><th>总数</th><th>可执行</th><th>等待</th><th>回避</th><th>行情未就绪</th></tr></thead><tbody>{history_rows}</tbody></table></div></section><div class="footer">免责声明：此页面仅把前一交易日量化候选与公开盘中行情进行规则核验，不构成投资建议，也不提供自动下单服务。请自行判断并严格执行风险控制。</div></main>{watch_script}<script>{auto_refresh}</script></body></html>'''
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>开盘建仓确认｜A股量化驾驶舱</title><style>{STYLE}</style></head><body><div class="bg-orb one"></div><div class="bg-orb two"></div><main class="wrap"><section class="opening-hero"><div><span class="eyebrow">前一交易日信号 · 盘中价格确认</span><h1>开盘建仓确认</h1><p>只核验昨天收盘后的候选是否仍满足计划价格与风险条件；系统不会自动下单。</p></div><div class="opening-action"><a class="btn" href="/">返回量化驾驶舱</a><a class="btn" href="/positions">交易复盘台</a><button class="btn primary" onclick="location.reload()">立即刷新</button></div></section><section class="card" style="margin-bottom:16px"><div class="category-head"><div><h2>{esc(session.get("label"))}</h2><p>核验时点：{esc(payload.get("checked_at") or session.get("time"))}｜信号数据日：{esc(payload.get("source_date"))}</p></div><div class="opening-status"><b>自动核验</b><br>交易日 {esc(payload.get("schedule"))}<br><span class="muted">{esc(session.get("next_action"))}</span></div></div><div class="opening-grid"><div class="opening-kpi"><div class="t">核验候选</div><div class="n">{safe_float(summary.get("total")):.0f}</div></div><div class="opening-kpi"><div class="t">可计划内执行</div><div class="n" style="color:#74f0b9">{safe_float(summary.get("eligible")):.0f}</div></div><div class="opening-kpi"><div class="t">等待确认</div><div class="n" style="color:#ffe28b">{safe_float(summary.get("wait")):.0f}</div></div><div class="opening-kpi"><div class="t">不建议参与/追高</div><div class="n" style="color:#ff9ba8">{safe_float(summary.get("avoid")):.0f}</div></div></div><div class="opening-note"><b>保守多条件确认模型：</b>必须同时通过计划价格区间、开盘溢价、止损、开盘承接、昨日评分、RPS60/风险标签等门槛。情绪/涨停类信号只显示“等待人工确认”；手动添加的股票还需通过 MA20/MA60、多头斜率、量能和乖离门槛。任一关键条件失败就等待或放弃，不为凑数量降低标准。{esc(payload.get("message"))}</div></section><section class="card risk-planner"><div class="category-head"><div><h2>早盘风险预算与仓位预案</h2><p>按账户风险预算和单股仓位上限计算整手数量，取两种限制中的较小值。参数只保存在当前浏览器标签页。</p></div><button class="btn" onclick="exportOpeningCsv()">导出当前核验CSV</button></div><div class="risk-controls"><label>账户资金（元）<input id="riskCapital" type="number" min="1000" step="1000" value="100000" oninput="saveRiskSettings()"></label><label>单笔最大风险（%）<input id="riskPct" type="number" min="0.1" max="10" step="0.1" value="0.5" oninput="saveRiskSettings()"></label><label>单股仓位上限（%）<input id="maxPosPct" type="number" min="1" max="100" step="1" value="20" oninput="saveRiskSettings()"></label><label>组合总仓位上限（%）<input id="portfolioPct" type="number" min="1" max="100" step="1" value="60" oninput="saveRiskSettings()"></label><label>组合总止损风险（%）<input id="portfolioRiskPct" type="number" min="0.1" max="20" step="0.1" value="2" oninput="saveRiskSettings()"></label></div><div id="portfolioSummary" class="portfolio-summary">组合预案等待盘中核验结果</div><div class="small muted">系统按页面排序依次分配仓位，同时受单股风险、单股仓位、组合总仓位和组合总止损风险约束。只有“可计划内执行”的股票占用组合预算；其余股票仅作比较预案。</div></section><section class="card"><div class="category-head"><div><h2>盘中核验明细</h2><p>{esc(monitor_desc)} 状态为“可计划内执行”也不代表保证收益，实际执行仍应采用预设止损与风险预算。</p></div><span class="pill">公开行情快照</span></div><div class="opening-table">{('<table><thead><tr><th>股票</th><th>建仓状态</th><th>战法</th><th>现价</th><th>开盘表现</th><th>昨日计划</th><th>仓位预案</th><th>条件校验</th><th>执行说明</th></tr></thead><tbody>'+table+'</tbody></table>') if rows else table}</div></section><section class="card opening-history"><div class="category-head"><div><h2>最近三日自动核验轨迹 <span class="pill">近3日 {len(history)} 次</span></h2><p>每次定时核验都会保存逐股详情；仅保留最近三个自然日，可查看加入监控基准、本次快照和当前行情的涨跌对比。</p></div><span class="pill">最近3日 {len(history)} 次</span></div><div class="opening-table"><table><thead><tr><th>核验时间</th><th>信号日</th><th>总数</th><th>可执行</th><th>等待</th><th>回避</th><th>行情未就绪</th><th>详情</th></tr></thead><tbody>{history_rows}</tbody></table></div></section><div class="footer">免责声明：此页面仅把前一交易日量化候选与公开盘中行情进行规则核验，不构成投资建议，也不提供自动下单服务。请自行判断并严格执行风险控制。</div></main>{watch_script}<script>{auto_refresh}</script></body></html>'''
 STYLE = r'''
 :root{--bg:#050914;--panel:#0d1628;--panel2:#111e34;--text:#eaf2ff;--muted:#91a7c6;--line:#223957;--cyan:#58dcff;--blue:#7fa6ff;--green:#42d392;--yellow:#ffd166;--red:#ff6b6b;--purple:#b794ff}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:linear-gradient(140deg,#050914,#091426 45%,#111827);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif}.bg-orb{position:fixed;border-radius:999px;filter:blur(40px);opacity:.45;pointer-events:none}.bg-orb.one{width:430px;height:430px;background:#1262ff;left:-120px;top:-100px}.bg-orb.two{width:360px;height:360px;background:#06b6d4;right:2%;top:120px}.wrap{max-width:1500px;margin:0 auto;padding:26px;position:relative}.hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:start;margin-bottom:18px}.eyebrow{display:inline-flex;gap:8px;align-items:center;border:1px solid #245179;background:#0b223b;padding:7px 10px;border-radius:999px;color:#b9eaff;font-weight:800;font-size:12px}.title h1{font-size:38px;letter-spacing:-1px;margin:12px 0 6px}.title p{color:var(--muted);margin:0;line-height:1.7}.actions{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}.btn{border:1px solid #2c4a71;background:#11233d;color:#eff7ff;padding:11px 15px;border-radius:14px;cursor:pointer;text-decoration:none;font-weight:900;box-shadow:0 10px 24px #0004}.btn:hover{transform:translateY(-1px);background:#173458}.btn.primary{border:0;background:linear-gradient(90deg,#1677ff,#06b6d4)}.grid{display:grid;grid-template-columns:minmax(0,1.42fr) 410px;gap:16px}.card{background:linear-gradient(180deg,rgba(17,31,54,.90),rgba(8,16,29,.92));border:1px solid var(--line);border-radius:24px;padding:18px;box-shadow:0 22px 55px #0007;backdrop-filter:blur(14px)}.card h2,.card h3{margin:0 0 12px}.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin:16px 0}.kpi{background:linear-gradient(180deg,#142844,#0e1b30);border:1px solid #274260;border-radius:18px;padding:14px;min-height:86px}.kpi .label{font-size:12px;color:var(--muted)}.kpi .value{font-size:25px;font-weight:1000;margin-top:8px}.recommend{font-size:18px;line-height:1.75;padding:17px;border:1px solid #26729e;background:linear-gradient(135deg,#1570ef35,#06b6d425);border-radius:18px}.scope{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.scope div{border:1px solid #25415f;background:#091a2d;border-radius:14px;padding:12px;color:#cfe1f7}.category-panel{margin:0 0 18px}.category-head{display:flex;justify-content:space-between;gap:12px;align-items:end;margin:0 2px 10px}.category-head h2{margin:0;font-size:19px}.category-head p{margin:3px 0 0;color:var(--muted);font-size:13px;line-height:1.55}.category-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.category-card{position:relative;text-align:left;border:1px solid #294b70;background:linear-gradient(145deg,#102743,#0b1729);color:var(--text);border-radius:17px;padding:13px;cursor:pointer;transition:.16s}.category-card:hover,.category-card.active{transform:translateY(-2px);border-color:#59d7ff;background:linear-gradient(145deg,#123b63,#102238);box-shadow:0 12px 24px #0005}.category-card .cat-name{font-weight:950;font-size:15px}.category-card .cat-count{position:absolute;right:12px;top:12px;color:#80efd0;font-size:22px;font-weight:950}.category-card .cat-items{color:#9eb6d2;font-size:12px;line-height:1.55;margin:8px 34px 0 0;min-height:37px}.category-card .cat-note{color:#ffc96d;font-size:11px;margin-top:6px}.strategy-panel{margin:0 0 18px}.strategy-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.strategy-group{border:1px solid #294b70;background:#09182b;border-radius:16px;padding:12px}.strategy-group-title{font-size:13px;font-weight:950;color:#8edfff;margin-bottom:9px}.strategy-chips{display:flex;flex-wrap:wrap;gap:7px}.strategy-chip{border:1px solid #305276;background:#0d223b;color:#dcecff;border-radius:999px;padding:7px 10px;cursor:pointer;font-size:12px;font-weight:800}.strategy-chip:hover,.strategy-chip.active{background:#1677ff;border-color:#6ce4ff;color:#fff}.strategy-chip em{font-style:normal;opacity:.74;margin-left:4px}.feedback-note{margin:0 0 11px;color:#a9c5e4;font-size:12px;line-height:1.65}.feedback-table{overflow:auto;border:1px solid #284968;border-radius:14px;max-height:300px}.feedback-table table{min-width:860px}.feedback-table th,.feedback-table td{padding:9px 10px}.feedback-up{color:#53e0a0;font-weight:900}.feedback-down{color:#ff9b9b;font-weight:900}.exec-stage{display:inline-block;border:1px solid #4675a0;background:#153052;border-radius:999px;padding:4px 7px;font-size:11px;color:#d7ecff;font-weight:900}.tactic-table{margin-top:12px}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:15px 0}.tab{padding:8px 12px;border:1px solid #2b4770;background:#0d1d33;border-radius:999px;color:#cfe2ff;cursor:pointer;font-weight:800}.tab.active{background:linear-gradient(90deg,#1d5d91,#1677ff);color:white;border-color:#58dcff}.toolbar{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin:12px 0}.search{background:#09182b;border:1px solid #2b4770;color:white;border-radius:13px;padding:11px;min-width:280px}.switches{display:flex;gap:8px;flex-wrap:wrap}.pill{display:inline-flex;gap:6px;align-items:center;border:1px solid #2a466a;background:#0a1b30;border-radius:999px;padding:7px 10px;color:#c8dbf5;font-size:12px;font-weight:800}.table-wrap{overflow:auto;border-radius:16px;border:1px solid var(--line);max-height:670px}table{width:100%;border-collapse:collapse;min-width:1700px;background:#081426}th,td{padding:11px 10px;border-bottom:1px solid #1d314e;white-space:nowrap;text-align:left}th{position:sticky;top:0;background:#132641;color:#bfd1ed;font-size:12px;z-index:1}tr:hover{background:#10223a}.reason{max-width:380px;overflow:hidden;text-overflow:ellipsis}.badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:900}.strong{background:#2ad78226;color:var(--green);border:1px solid #42d39266}.good{background:#7aa2ff22;color:#b8c9ff;border:1px solid #7aa2ff66}.watch{background:#ffd16622;color:var(--yellow);border:1px solid #ffd16666}.risk{background:#ff6b6b22;color:#ffaaaa;border:1px solid #ff6b6b66}.side{display:flex;flex-direction:column;gap:16px}.leader{display:grid;gap:10px}.leader-card{border:1px solid #284463;border-radius:16px;background:#0a1a2d;padding:13px}.leader-card b{font-size:15px}.muted{color:var(--muted)}.small{font-size:12px;line-height:1.75}.book{display:grid;gap:10px}.book-item{border:1px solid #263f60;background:linear-gradient(180deg,#0b1d33,#081729);border-radius:16px;padding:12px}.book-item .items{color:#dcecff;font-weight:900}.bar{height:8px;background:#0a1728;border-radius:999px;overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;background:linear-gradient(90deg,#42d392,#58dcff);border-radius:999px}.hist{display:grid;gap:8px}.hist-row{display:flex;justify-content:space-between;gap:8px;border:1px solid #243c5a;background:#0a1a2e;border-radius:12px;padding:9px 10px}.footer{margin:18px 0;color:#7890af;font-size:12px;line-height:1.7}.modal{position:fixed;inset:0;background:#000c;display:none;align-items:center;justify-content:center;padding:24px;z-index:1000}.modal.show{display:flex}.modal-card{width:min(1100px,96vw);max-height:86vh;overflow:auto;background:#0c1729;border:1px solid #2b4770;border-radius:20px;padding:20px;box-shadow:0 30px 80px #000}.x{float:right;background:#1b2b45;border:1px solid #38577f;color:white;border-radius:10px;padding:6px 10px;cursor:pointer}pre{white-space:pre-wrap;color:#d9e8ff;line-height:1.55}@media (max-width:1100px){.hero,.grid{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}.category-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.scope{grid-template-columns:1fr}.actions{justify-content:flex-start}}@media (max-width:650px){.category-grid,.strategy-groups{grid-template-columns:1fr}.category-head{align-items:start;flex-direction:column}}.overview-panel{margin:0 0 18px;border-color:#2b6585;background:linear-gradient(145deg,rgba(19,48,79,.96),rgba(8,18,33,.94))}.overview-head{display:flex;justify-content:space-between;gap:14px;align-items:start}.market-badge{display:inline-flex;align-items:center;gap:8px;border:1px solid #4382a8;background:#0b2842;border-radius:999px;padding:7px 11px;font-size:12px;font-weight:950;color:#bceeff}.market-badge.weak{border-color:#8f4b55;background:#3b1720;color:#ffc1c1}.market-badge.strong{border-color:#2f8f6a;background:#0f382c;color:#a6f4d1}.scan-chip{border:1px solid #315577;background:#091a2d;border-radius:13px;padding:9px 12px;color:#bed4ed;font-size:12px;line-height:1.55}.overview-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(320px,.8fr);gap:12px;margin-top:12px}.overview-box{border:1px solid #2b4c6e;background:#091a2d;border-radius:15px;padding:12px}.overview-box h3{font-size:14px;margin:0 0 9px}.dist-list{display:grid;gap:7px}.dist-row{display:grid;grid-template-columns:92px 1fr 34px;gap:8px;align-items:center;font-size:12px}.dist-bar{height:8px;border-radius:999px;background:#13243a;overflow:hidden}.dist-bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#42d392,#58dcff)}.quick-nav{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.quick-nav a{color:#bfeaff;text-decoration:none;border:1px solid #34577d;background:#0b2139;border-radius:999px;padding:6px 9px;font-size:12px;font-weight:850}.strategy-panel.collapsed .strategy-groups{display:none}.strategy-panel.collapsed{padding-bottom:12px}.table-wrap{max-height:720px}.table-wrap thead th{position:sticky;top:0;z-index:4;background:#10243b}.table-wrap th:nth-child(1),.table-wrap td:nth-child(1){position:sticky;left:0;z-index:3;background:#0c1b2e}.table-wrap th:nth-child(2),.table-wrap td:nth-child(2){position:sticky;left:42px;z-index:3;background:#0c1b2e}.table-wrap th:nth-child(3),.table-wrap td:nth-child(3){position:sticky;left:116px;z-index:3;background:#0c1b2e}.table-wrap thead th:nth-child(-n+3){z-index:6;background:#10243b}.filter-btn{border:1px solid #34577d;background:#0d223b;color:#dcecff;border-radius:999px;padding:7px 10px;cursor:pointer;font-size:12px;font-weight:850}.filter-btn.active{background:#1677ff;border-color:#6ce4ff;color:#fff}.usage-steps{margin:0;padding-left:20px;color:#cfe0f3;font-size:13px;line-height:1.85}.usage-steps b{color:#8fe6ff}@media (max-width:900px){.overview-grid{grid-template-columns:1fr}.overview-head{flex-direction:column}.table-wrap th:nth-child(1),.table-wrap td:nth-child(1),.table-wrap th:nth-child(2),.table-wrap td:nth-child(2),.table-wrap th:nth-child(3),.table-wrap td:nth-child(3){position:static}}.fundamental-panel{margin:0 0 18px}.fundamental-search{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.fundamental-input{min-width:220px;flex:1;border:1px solid #34577d;background:#09192c;color:#eef6ff;border-radius:13px;padding:11px 13px;font-size:15px;outline:none}.fundamental-input:focus{border-color:#58dcff;box-shadow:0 0 0 3px #58dcff22}.sample-chips{display:flex;gap:7px;flex-wrap:wrap}.sample-chip,.code-link{border:1px solid #34577d;background:#0d2540;color:#9ee9ff;border-radius:999px;padding:6px 9px;font-weight:800;cursor:pointer}.code-link{padding:3px 6px;border-radius:7px;font-size:12px}.fundamental-result{margin-top:14px}.fundamental-loading,.fundamental-error{padding:14px;border-radius:14px;border:1px solid #285276;background:#091a2e}.fundamental-error{color:#ffb1b1;border-color:#853e4c}.fundamental-title{display:flex;justify-content:space-between;gap:12px;align-items:start}.fundamental-title h3{margin:0}.fundamental-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}.metric{border:1px solid #294564;border-radius:14px;background:#0a1a2d;padding:11px}.metric .label{color:var(--muted);font-size:12px}.metric .value{font-size:19px;font-weight:950;margin-top:5px}.fundamental-two{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}.facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.fact{border:1px solid #243f60;background:#0a192b;border-radius:11px;padding:8px 10px;font-size:12px}.fact b{color:#9edfff;display:block;margin-bottom:3px}.assessment{display:grid;gap:8px}.assessment-item{border-left:3px solid #6da8d8;background:#0a1a2d;padding:9px 11px;border-radius:0 10px 10px 0;font-size:12px}.assessment-item.up{border-color:#42d392}.assessment-item.down{border-color:#ff6b6b}.assessment-item.warn{border-color:#ffd166}.business-summary{margin:12px 0 0;padding:11px;border:1px solid #243f60;background:#09182a;border-radius:12px;color:#cce0f6;font-size:13px;line-height:1.7}.fundamental-note{color:var(--muted);font-size:12px;line-height:1.65;margin-top:10px}@media (max-width:900px){.fundamental-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.fundamental-two{grid-template-columns:1fr}}@media (max-width:650px){.fundamental-grid,.facts{grid-template-columns:1fr}}
 
@@ -1482,6 +1718,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u=urlparse(self.path); path=u.path
         if path in ("/","/index.html"): return self.send_body(page_html(load_latest_payload()).encode())
+        if path=="/opening/detail":
+            allowed,retry=consume_rate(f"opening-detail:{self.client_key()}",20,60)
+            global_allowed,global_retry=consume_rate("opening-detail:global",120,60)
+            if not allowed or not global_allowed:
+                return self.send_body("详情查询过于频繁，请稍后再试".encode(),429,"text/plain; charset=utf-8",{"Retry-After":str(max(retry,global_retry,1))})
+            filename = (parse_qs(u.query).get("file") or [""])[0]
+            return self.send_body(opening_detail_page_html(opening_detail_payload(filename)).encode())
         if path=="/opening":
             allowed,retry=consume_rate(f"opening-page:{self.client_key()}",30,60)
             global_allowed,global_retry=consume_rate("opening-page:global",180,60)

@@ -2061,8 +2061,22 @@ body.decision-open{overflow:hidden}.decision-modal{padding:18px;overscroll-behav
 
 '''
 
+STYLE += r'''
+/* 候选表会在浏览器内动态插入“勾选操作”列。固定列的位置按实际列宽计算，
+   避免横向滚动时股票代码与左侧列脱节或重叠。 */
+#candidates .table-wrap table{--candidate-col-1:116px;--candidate-col-2:46px}
+#candidates .table-wrap th:nth-child(1),#candidates .table-wrap td:nth-child(1){position:sticky;left:0;z-index:3;background:#0c1b2e}
+#candidates .table-wrap th:nth-child(2),#candidates .table-wrap td:nth-child(2){position:sticky;left:var(--candidate-col-1);z-index:3;background:#0c1b2e}
+#candidates .table-wrap th:nth-child(3),#candidates .table-wrap td:nth-child(3){position:sticky;left:calc(var(--candidate-col-1) + var(--candidate-col-2));z-index:3;background:#0c1b2e}
+#candidates .table-wrap thead th:nth-child(-n+3){z-index:7;background:#10243b}
+@media(max-width:900px){#candidates .table-wrap th:nth-child(1),#candidates .table-wrap td:nth-child(1),#candidates .table-wrap th:nth-child(2),#candidates .table-wrap td:nth-child(2),#candidates .table-wrap th:nth-child(3),#candidates .table-wrap td:nth-child(3){position:static}}
+'''
+
 SCRIPT = r'''
 try{localStorage.removeItem('quant_token')}catch(e){}
+function syncCandidateStickyColumns(){const table=document.querySelector('#candidates .table-wrap table');const head=table?.querySelector('thead tr');if(!table||!head||head.children.length<3)return;const first=Math.ceil(head.children[0].getBoundingClientRect().width),second=Math.ceil(head.children[1].getBoundingClientRect().width);if(first>0)table.style.setProperty('--candidate-col-1',`${first}px`);if(second>0)table.style.setProperty('--candidate-col-2',`${second}px`)}
+function startCandidateStickySync(){const app=document.getElementById('app');if(!app)return;let queued=false;const queue=()=>{if(queued)return;queued=true;requestAnimationFrame(()=>{queued=false;syncCandidateStickyColumns()})};new MutationObserver(queue).observe(app,{childList:true,subtree:true});window.addEventListener('resize',queue,{passive:true});queue()}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',startCandidateStickySync,{once:true});else startCandidateStickySync();
 function getAdminToken(){try{return sessionStorage.getItem('quant_token')||''}catch(e){return ''}}function setAdminToken(v){try{sessionStorage.setItem('quant_token',v)}catch(e){}}function clearAdminToken(){try{sessionStorage.removeItem('quant_token')}catch(e){}alert('本标签页的管理令牌已清除')}
 const esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 let active='全部', activeStrategy='全部', q='', priorityOnly=false, showAllRows=false, strategyExpanded=false, compactTable=true;

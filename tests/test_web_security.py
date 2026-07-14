@@ -94,6 +94,17 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("下次计划", page)
         self.assertIn("数据校验", page)
 
+    def test_candidate_sticky_columns_follow_dynamic_monitor_widths(self):
+        page = app.page_html({"has_data": False, "watchlist": {}})
+        for marker in (
+            "syncCandidateStickyColumns",
+            "startCandidateStickySync",
+            "--candidate-col-1",
+            "--candidate-col-2",
+            "calc(var(--candidate-col-1) + var(--candidate-col-2))",
+        ):
+            self.assertIn(marker, page)
+
     def test_opening_history_reads_valid_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
             report_dir = Path(td)
